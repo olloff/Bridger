@@ -64,6 +64,32 @@ def parse_upload_limit_mb(value, default_mb: float) -> int:
         except (TypeError, ValueError): mb = default_mb
     return max(int(mb * 1024 * 1024), 1024 * 1024)
 
+def _normalize_language(value):
+    """Normalize a ``voice_transcription.language`` value.
+
+    Returns one of:
+
+    * ``None``          — auto-detect (missing, empty, or ``"auto"``).
+    * ``str``           — a single forced language (unchanged legacy behavior).
+    * ``list[str]``     — a *priority list*: lowercased ISO codes, in order,
+                          with any ``"auto"`` / empty entries dropped. Backends
+                          try to transcribe in one of these, in order, and fall
+                          back to auto-detect when none is a good fit.
+
+    A scalar is kept verbatim (so ``"auto"`` stays the sentinel the backends
+    already understand); only a YAML list activates priority/fallback."""
+    if isinstance(value, (list, tuple)):
+        langs = []
+        for item in value:
+            s = str(item).strip().lower()
+            if s and s != "auto":
+                langs.append(s)
+        return langs or None
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
 def normalize_user_ids(value) -> set[int]:
     """Normalize a YAML user-id value to a set of ints.
 
@@ -89,7 +115,10 @@ def platform_voice_transcription_config(platform_cfg: dict) -> dict | None:
           openai_api_key: sk-...
           openai_model: whisper-1   # optional, default "whisper-1"
           local_model: small        # optional, default "small" (tiny|base|small|medium|large)
-          language: auto            # ISO code or "auto" (auto-detect)
+          language: auto            # ISO code, "auto", or a priority LIST:
+                                    #   language: [uk, en, ru]
+                                    # A list means: prefer these in order,
+                                    # falling back to auto-detect.
           max_duration_seconds: 600 # skip audio longer than this
           reply_with_transcript: false   # local reply with transcript in source chat
           bridge_with_transcript: true   # include transcript when bridging the voice
@@ -104,9 +133,7 @@ def platform_voice_transcription_config(platform_cfg: dict) -> dict | None:
     except (TypeError, ValueError): max_dur = 600.0
     if max_dur < 0: max_dur = 0.0
 
-    language = raw.get("language")
-    if language is not None:
-        language = str(language).strip() or None
+    language = _normalize_language(raw.get("language"))
 
     reply_with = bool(raw.get("reply_with_transcript", False))
     bridge_with = bool(raw.get("bridge_with_transcript", True))

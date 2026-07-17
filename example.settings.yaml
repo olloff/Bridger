@@ -88,7 +88,11 @@ platforms:
     #   openai_api_key: sk-...        # required if provider=openai
     #   openai_model: whisper-1       # default whisper-1
     #   local_model: small            # tiny|base|small|medium|large (for provider=local)
-    #   language: auto                # ISO code (en, ru, …) or "auto"
+    #   language: auto                # ISO code (en, ru, …), "auto", or a
+    #                                 # priority LIST for fallback, e.g.
+    #                                 #   language: [uk, en, ru]
+    #                                 # → prefer Ukrainian, then English, then
+    #                                 # Russian, falling back to auto-detect.
     #   max_duration_seconds: 600     # skip voice longer than this (10 min default)
     #   reply_with_transcript: false  # local reply in source chat
     #   bridge_with_transcript: true  # include transcript when bridging

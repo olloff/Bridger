@@ -23,8 +23,9 @@ class OpenAITranscriber(Transcriber):
     def __init__(self, api_key: str, model: str = "whisper-1"):
         self.api_key = api_key
         self.model = model
+        self._priority_notice_logged = False
 
-    async def transcribe(self, path: str, language: str | None = None) -> str | None:
+    async def transcribe(self, path: str, language: "str | list[str] | None" = None) -> str | None:
         if not path or not os.path.isfile(path):
             return None
         try:
@@ -38,6 +39,26 @@ class OpenAITranscriber(Transcriber):
             )
             return None
 
+        # Priority list: the OpenAI API exposes no per-language confidence,
+        # so we can't do the confidence-gated forcing the local backend does.
+        # We honor the spirit — prefer the listed languages — by letting
+        # Whisper auto-detect (which handles all common languages well) and
+        # never forcing, so a genuinely foreign clip isn't garbled. Real
+        # priority/fallback is a local-backend capability.
+        if isinstance(language, (list, tuple)) and language:
+            if not self._priority_notice_logged:
+                logger.info(
+                    "OpenAI backend: language priority %s treated as auto-detect "
+                    "(confidence-gated forcing is local-only)", list(language),
+                )
+                self._priority_notice_logged = True
+            language = None
+
+        lang = language if (language and language != "auto") else None
+        return await self._post(path, lang)
+
+    async def _post(self, path: str, language: "str | None") -> "str | None":
+        """POST the audio once and return the plain transcript (or ``None``)."""
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             with open(path, "rb") as fh:
@@ -62,8 +83,7 @@ class OpenAITranscriber(Transcriber):
                                 "OpenAI Whisper failed (%d): %s", resp.status, body[:300],
                             )
                             return None
-                        text = body.strip()
-                        return text or None
+                        return body.strip() or None
         except (aiohttp.ClientError, OSError) as exc:
             logger.warning("OpenAI Whisper transport error: %s", exc)
             return None
