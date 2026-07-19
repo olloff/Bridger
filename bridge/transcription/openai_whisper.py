@@ -24,6 +24,18 @@ class OpenAITranscriber(Transcriber):
         self.api_key = api_key
         self.model = model
         self._priority_notice_logged = False
+        self._session: aiohttp.ClientSession | None = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=_TIMEOUT)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     async def transcribe(self, path: str, language: "str | list[str] | None" = None) -> str | None:
         if not path or not os.path.isfile(path):
@@ -74,16 +86,15 @@ class OpenAITranscriber(Transcriber):
                 # response_format=text — server returns the plain transcript
                 # as the body, no JSON parse needed.
                 data.add_field("response_format", "text")
-                timeout = aiohttp.ClientTimeout(total=_TIMEOUT)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(_API_URL, data=data, headers=headers) as resp:
-                        body = await resp.text()
-                        if resp.status != 200:
-                            logger.warning(
-                                "OpenAI Whisper failed (%d): %s", resp.status, body[:300],
-                            )
-                            return None
-                        return body.strip() or None
+                session = self._get_session()
+                async with session.post(_API_URL, data=data, headers=headers) as resp:
+                    body = await resp.text()
+                    if resp.status != 200:
+                        logger.warning(
+                            "OpenAI Whisper failed (%d): %s", resp.status, body[:300],
+                        )
+                        return None
+                    return body.strip() or None
         except (aiohttp.ClientError, OSError) as exc:
             logger.warning("OpenAI Whisper transport error: %s", exc)
             return None
