@@ -94,6 +94,8 @@ platforms:
     #                                 # → prefer Ukrainian, then English, then
     #                                 # Russian, falling back to auto-detect.
     #   max_duration_seconds: 600     # skip voice longer than this (10 min default)
+    #   max_file_mb: 25               # refuse before download/API work
+    #   transcribe_filtered_messages: false # true opts into pre-filter paid/CPU work
     #   reply_with_transcript: false  # local reply in source chat
     #   bridge_with_transcript: true  # include transcript when bridging
 
@@ -142,6 +144,11 @@ platforms:
     #   openai_api_key: sk-...
     #   reply_with_transcript: false
     #   bridge_with_transcript: true
+
+  # whatsapp:
+    # destination_size_limit_mb: 64   # also the in-memory inbound cap
+    # reject_unknown_media_size: true # safest with Neonize versions exposing fileLength
+    # max_concurrent_downloads: 2     # download_any materializes bytes in RAM
 
 # Bridges
 # Each bridge links two or more platform chats together.
@@ -238,6 +245,10 @@ bridges:
   #     buffer_media: false       # default false. If true, media files
   #                               # are held until the digest fires and
   #                               # arrive together with the text thread.
+  #     max_entries: 500          # flush early when any bound is reached
+  #     max_text_bytes: 1048576
+  #     max_files: 25
+  #     max_file_bytes: 268435456
 
   # Link enrichment: when a bridged message contains a supported link,
   # fetch the post and append its text + media to the OTHER side as a
@@ -246,8 +257,11 @@ bridges:
   # Failures fall back to just the bare link. On digest bridges the
   # enriched text + media are folded into the same digest, ordered right
   # after the link by the original message's timestamp.
-  #   X / Twitter: single-post text + media via the free fxtwitter API
-  #     (no thread unroll in this version).
+  #   X / Twitter: post text + media via the free fxtwitter API. With
+  #     unroll: true, self-reply threads are reconstructed by walking UP
+  #     the reply chain — a link to the LAST/middle tweet unrolls the
+  #     whole thread above it; a link to the FIRST tweet has no ancestors
+  #     to walk (free-API limitation) and behaves like a single post.
   #   Facebook:    public video/reel media via yt-dlp (no caption).
   #   Instagram:   public post/reel media + caption via yt-dlp.
   #   TikTok:      public video + caption via yt-dlp.
@@ -266,6 +280,9 @@ bridges:
   #     max_links: 3                    # max enriched links per message
   #     quote_original: true            # reply-to the bridged message that
   #                                     # contained the link (default true)
+  #     unroll: false                   # Twitter/X: merge same-author reply
+  #                                     # chains into one thread (see above)
+  #     max_thread_tweets: 25           # cap tweets fetched per thread (1-100)
   #     # Most Facebook and Instagram posts are login-walled — yt-dlp can't
   #     # download them without authentication. Export a Netscape-format
   #     # cookies.txt from a browser logged into FB/IG (e.g. the

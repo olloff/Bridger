@@ -187,5 +187,120 @@ class TestFormatEnrichment(unittest.TestCase):
         self.assertEqual(_format_enrichment(r, lambda s: s), "")
 
 
+class TestTwitterUnroll(unittest.TestCase):
+    """Walk-up thread unroll against a canned fxtwitter payload store —
+    no network; _fetch_json is replaced with an async fake."""
+
+    URL = "https://x.com/alice/status/103"
+
+    @staticmethod
+    def _tweet(tid, screen, text, parent_id=None, replying_to=None):
+        return {
+            "id": str(tid),
+            "text": text,
+            "author": {"name": screen.capitalize(), "screen_name": screen},
+            "replying_to_status": str(parent_id) if parent_id else None,
+            "replying_to": replying_to,
+        }
+
+    def _enricher(self, store: dict) -> TwitterEnricher:
+        tw = TwitterEnricher()
+        async def fake_fetch(screen, tid):
+            t = store.get(str(tid))
+            return {"tweet": t} if t else None
+        tw._fetch_json = fake_fetch
+        return tw
+
+    def _run(self, tw, cfg):
+        import asyncio
+        return asyncio.run(tw.enrich(self.URL, cfg, dest_dir="unused"))
+
+    def test_unroll_walks_to_root_chronological(self):
+        store = {
+            "101": self._tweet(101, "alice", "first"),
+            "102": self._tweet(102, "alice", "second", parent_id=101, replying_to="alice"),
+            "103": self._tweet(103, "alice", "third", parent_id=102, replying_to="alice"),
+        }
+        r = self._run(self._enricher(store), {"unroll": True, "max_thread_tweets": 25})
+        self.assertEqual(r.text, "first\n\nsecond\n\nthird")
+        self.assertEqual(r.author, "Alice")
+
+    def test_unroll_disabled_single_post(self):
+        store = {"103": self._tweet(103, "alice", "third", parent_id=102, replying_to="alice")}
+        r = self._run(self._enricher(store), {})
+        self.assertEqual(r.text, "third")
+
+    def test_root_link_degrades_to_single(self):
+        # Linked tweet has no ancestors — same result as no unroll.
+        store = {"103": self._tweet(103, "alice", "only")}
+        r = self._run(self._enricher(store), {"unroll": True})
+        self.assertEqual(r.text, "only")
+
+    def test_stops_at_author_change_via_replying_to(self):
+        # 103 replies to bob's tweet — not a self-thread; keep 103 only and
+        # never fetch the foreign parent.
+        store = {
+            "50": self._tweet(50, "bob", "bob says"),
+            "103": self._tweet(103, "alice", "my reply", parent_id=50, replying_to="bob"),
+        }
+        r = self._run(self._enricher(store), {"unroll": True})
+        self.assertEqual(r.text, "my reply")
+
+    def test_stops_at_author_change_post_fetch(self):
+        # replying_to missing → fetch happens, but the parent's author
+        # differs → parent discarded.
+        store = {
+            "50": self._tweet(50, "bob", "bob says"),
+            "103": self._tweet(103, "alice", "my reply", parent_id=50),
+        }
+        r = self._run(self._enricher(store), {"unroll": True})
+        self.assertEqual(r.text, "my reply")
+
+    def test_partial_on_fetch_failure(self):
+        # 101 missing from store — keep what was walked (102, 103).
+        store = {
+            "102": self._tweet(102, "alice", "second", parent_id=101, replying_to="alice"),
+            "103": self._tweet(103, "alice", "third", parent_id=102, replying_to="alice"),
+        }
+        r = self._run(self._enricher(store), {"unroll": True})
+        self.assertEqual(r.text, "second\n\nthird")
+
+    def test_cap_limits_fetches(self):
+        store = {
+            str(i): self._tweet(i, "alice", f"t{i}",
+                                parent_id=i - 1 if i > 100 else None,
+                                replying_to="alice" if i > 100 else None)
+            for i in range(100, 104)
+        }
+        r = self._run(self._enricher(store), {"unroll": True, "max_thread_tweets": 2})
+        # cap=2 total → linked tweet + 1 ancestor
+        self.assertEqual(r.text, "t102\n\nt103")
+
+    def test_cycle_guard(self):
+        # 101 claims its parent is 103 — the seen-set breaks the loop.
+        store = {
+            "101": self._tweet(101, "alice", "first", parent_id=103, replying_to="alice"),
+            "103": self._tweet(103, "alice", "third", parent_id=101, replying_to="alice"),
+        }
+        r = self._run(self._enricher(store), {"unroll": True})
+        self.assertEqual(r.text, "first\n\nthird")
+
+
+class TestEnrichConfigUnroll(unittest.TestCase):
+    def test_unroll_defaults_off(self):
+        cfg = bridge_enrich_config({"enrich": {"enabled": True}})
+        self.assertFalse(cfg["unroll"])
+        self.assertEqual(cfg["max_thread_tweets"], 25)
+
+    def test_unroll_enabled_and_cap_clamped(self):
+        cfg = bridge_enrich_config({"enrich": {"enabled": True, "unroll": True, "max_thread_tweets": 5000}})
+        self.assertTrue(cfg["unroll"])
+        self.assertEqual(cfg["max_thread_tweets"], 100)
+
+    def test_cap_invalid_falls_back(self):
+        cfg = bridge_enrich_config({"enrich": {"enabled": True, "max_thread_tweets": "abc"}})
+        self.assertEqual(cfg["max_thread_tweets"], 25)
+
+
 if __name__ == "__main__":
     unittest.main()

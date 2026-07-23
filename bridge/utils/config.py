@@ -62,7 +62,9 @@ def parse_upload_limit_mb(value, default_mb: float) -> int:
     else:
         try: mb = float(value)
         except (TypeError, ValueError): mb = default_mb
-    return max(int(mb * 1024 * 1024), 1024 * 1024)
+    # Keep a configuration typo from effectively disabling every inbound
+    # memory/disk guard. Four GiB still covers Telegram user-account limits.
+    return min(max(int(mb * 1024 * 1024), 1024 * 1024), 4 * 1024 * 1024 * 1024)
 
 def _normalize_language(value):
     """Normalize a ``voice_transcription.language`` value.
@@ -120,6 +122,8 @@ def platform_voice_transcription_config(platform_cfg: dict) -> dict | None:
                                     # A list means: prefer these in order,
                                     # falling back to auto-detect.
           max_duration_seconds: 600 # skip audio longer than this
+          max_file_mb: 25           # skip before download/API work
+          transcribe_filtered_messages: false # opt in to pre-filter work
           reply_with_transcript: false   # local reply with transcript in source chat
           bridge_with_transcript: true   # include transcript when bridging the voice
 
@@ -132,6 +136,10 @@ def platform_voice_transcription_config(platform_cfg: dict) -> dict | None:
     try: max_dur = float(raw.get("max_duration_seconds", 600))
     except (TypeError, ValueError): max_dur = 600.0
     if max_dur < 0: max_dur = 0.0
+
+    try: max_file_mb = float(raw.get("max_file_mb", 25))
+    except (TypeError, ValueError): max_file_mb = 25.0
+    max_file_mb = min(max(max_file_mb, 1.0), 512.0)
 
     language = _normalize_language(raw.get("language"))
 
@@ -147,6 +155,8 @@ def platform_voice_transcription_config(platform_cfg: dict) -> dict | None:
         "local_model": (str(raw.get("local_model") or "small").strip() or "small"),
         "language": language,
         "max_duration_seconds": max_dur,
+        "max_file_bytes": int(max_file_mb * 1024 * 1024),
+        "transcribe_filtered_messages": bool(raw.get("transcribe_filtered_messages", False)),
         "reply_with_transcript": reply_with,
         "bridge_with_transcript": bridge_with,
     }
@@ -171,6 +181,10 @@ def bridge_digest_config(bridge: dict) -> dict | None:
           buffer_media: false      # default false — if true, media files
                                    # are held alongside text and
                                    # dispatched at flush time
+          max_entries: 500         # early flush bounds memory
+          max_text_bytes: 1048576  # aggregate UTF-8 bytes
+          max_files: 25            # buffered files per digest
+          max_file_bytes: 268435456 # aggregate buffered-file bytes
 
     Returns ``None`` if the key is missing or ``enabled`` is falsy."""
     raw = bridge.get("digest")
@@ -187,10 +201,20 @@ def bridge_digest_config(bridge: dict) -> dict | None:
     except (TypeError, ValueError):
         max_wait = 180.0
     if max_wait < 0: max_wait = 0.0
+
+    def _bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        try: value = int(raw.get(key, default))
+        except (TypeError, ValueError): value = default
+        return min(max(value, minimum), maximum)
+
     return {
         "wait_seconds": wait,
         "max_wait_seconds": max_wait,
         "buffer_media": bool(raw.get("buffer_media", False)),
+        "max_entries": _bounded_int("max_entries", 500, 1, 10000),
+        "max_text_bytes": _bounded_int("max_text_bytes", 1024 * 1024, 1024, 16 * 1024 * 1024),
+        "max_files": _bounded_int("max_files", 25, 1, 1000),
+        "max_file_bytes": _bounded_int("max_file_bytes", 256 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024),
     }
 
 def effective_mention_filters(bridge: dict, platform_default: list[str]) -> list[str]:
@@ -245,6 +269,8 @@ def bridge_enrich_config(bridge: dict) -> dict | None:
           quote_original: true            # reply-to the bridged message
           cookies_file: /app/.../cookies.txt  # yt-dlp auth (FB/IG login wall)
           keep_original_link: true        # informational (always true in MVP)
+          unroll: false                   # Twitter/X: walk UP the reply chain
+          max_thread_tweets: 25           # cap on tweets fetched per thread
 
     Returns ``None`` if the key is missing or ``enabled`` is falsy."""
     raw = bridge.get("enrich")
@@ -259,13 +285,17 @@ def bridge_enrich_config(bridge: dict) -> dict | None:
 
     try: max_media_mb = float(raw.get("max_media_mb", 50))
     except (TypeError, ValueError): max_media_mb = 50.0
-    if max_media_mb < 1: max_media_mb = 1.0
+    max_media_mb = min(max(max_media_mb, 1.0), 512.0)
 
     try: max_links = int(raw.get("max_links", 3))
     except (TypeError, ValueError): max_links = 3
-    if max_links < 1: max_links = 1
+    max_links = min(max(max_links, 1), 20)
 
     cookies_file = (str(raw.get("cookies_file")).strip() if raw.get("cookies_file") else "") or None
+
+    try: max_thread_tweets = int(raw.get("max_thread_tweets", 25))
+    except (TypeError, ValueError): max_thread_tweets = 25
+    max_thread_tweets = min(max(max_thread_tweets, 1), 100)
 
     return {
         "providers": providers,
@@ -275,6 +305,8 @@ def bridge_enrich_config(bridge: dict) -> dict | None:
         "quote_original": bool(raw.get("quote_original", True)),
         "cookies_file": cookies_file,
         "keep_original_link": bool(raw.get("keep_original_link", True)),
+        "unroll": bool(raw.get("unroll", False)),
+        "max_thread_tweets": max_thread_tweets,
     }
 
 
