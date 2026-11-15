@@ -632,5 +632,185 @@ class TestTelegramMediaClassification(unittest.IsolatedAsyncioTestCase):
         platform.router.on_file.assert_not_awaited()
 
 
+class TestTelegramSendFile(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        for name in ("pyrogram", "pyrogram.enums", "pyrogram.errors"):
+            sys.modules.setdefault(name, MagicMock())
+        from bridge.platforms import telegram as telegram_mod
+        self.mod = telegram_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+        self.app = MagicMock()
+        self._ids = iter(range(100, 200))
+        self.sends: list[tuple[str, tuple, dict]] = []  # (method, args, kwargs) in call order
+
+        def _method(name: str) -> AsyncMock:
+            async def _send(*args, **kwargs):
+                self.sends.append((name, args, kwargs))
+                return MagicMock(id=next(self._ids))
+            return AsyncMock(side_effect=_send)
+
+        for name in ("send_photo", "send_video", "send_audio", "send_voice", "send_document", "send_message"):
+            setattr(self.app, name, _method(name))
+        self.app.send_chat_action = AsyncMock()
+
+        platform = telegram_mod.TelegramPlatform.__new__(telegram_mod.TelegramPlatform)
+        platform.name = "telegram"
+        platform._destination_size_limit_bytes = 1000
+        platform._max_split_parts = 10
+        platform._bridge_for_chat = {}
+        platform._bridge_by_name = {}
+        platform._app = self.app
+        self.platform = platform
+
+    def _file(self, name: str, size: int) -> str:
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as fh: fh.write(b"\0" * size)
+        return path
+
+    async def test_file_under_limit_is_sent_untouched(self):
+        src = self._file("clip.mp4", 500)
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock()) as fit:
+            sent_id = await self.platform.send_file(-5, src, ".mp4", "Alice", reply_to_native_id=7)
+        fit.assert_not_awaited()
+        self.assertEqual(sent_id, 100)
+        ((method, args, kwargs),) = self.sends
+        self.assertEqual((method, args), ("send_video", (-5, src)))
+        self.assertEqual(kwargs["caption"], "<b>Alice:</b>")
+        self.assertEqual(kwargs["reply_to_message_id"], 7)
+        self.assertNotIn("file_name", kwargs)  # untouched files keep their own name
+        self.assertTrue(os.path.isfile(src))   # the source file is the router's to delete
+
+    async def test_oversized_file_is_compressed_and_temp_removed(self):
+        src = self._file("clip.mov", 5000)
+        small = self._file("bridge_xcode_a.mp4", 800)
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=[small])) as fit:
+            sent_id = await self.platform.send_file(-5, src, ".mov", "Alice")
+        fit.assert_awaited_once_with(src, 1000, max_parts=10)
+        self.assertEqual(sent_id, 100)
+        ((method, args, kwargs),) = self.sends
+        self.assertEqual((method, args), ("send_video", (-5, small)))
+        # Shown under the original stem with the new container's extension.
+        self.assertEqual(kwargs["file_name"], "clip.mp4")
+        self.assertEqual(kwargs["caption"], "<b>Alice:</b>")
+        self.assertFalse(os.path.exists(small))
+        self.assertTrue(os.path.isfile(src))
+
+    async def test_split_parts_sent_in_order_and_first_id_returned(self):
+        src = self._file("movie.mkv", 5000)
+        parts = [self._file(f"bridge_xcode_{i}.mp4", 900) for i in range(3)]
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=list(parts))):
+            sent_id = await self.platform.send_file(-5, src, ".mkv", "<Al>", reply_to_native_id=55)
+        self.assertEqual(sent_id, 100)
+        self.assertEqual([m for m, _, _ in self.sends], ["send_video"] * 3)
+        self.assertEqual([a[1] for _, a, _ in self.sends], parts)
+        self.assertEqual(
+            [k["file_name"] for _, _, k in self.sends],
+            ["movie_part1of3.mp4", "movie_part2of3.mp4", "movie_part3of3.mp4"],
+        )
+        self.assertEqual(
+            [k["caption"] for _, _, k in self.sends],
+            [f"<b>&lt;Al&gt;:</b> (part {i}/3)" for i in (1, 2, 3)],
+        )
+        # Only the first part is a reply.
+        self.assertEqual([k["reply_to_message_id"] for _, _, k in self.sends], [55, None, None])
+        for part in parts:
+            self.assertFalse(os.path.exists(part))
+
+    async def test_split_voice_note_goes_out_as_audio(self):
+        src = self._file("voice.ogg", 5000)
+        parts = [self._file(f"bridge_xcode_{i}.m4a", 900) for i in range(2)]
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=list(parts))):
+            await self.platform.send_file(-5, src, ".ogg", "Alice")
+        # The parts are AAC in .m4a — not something send_voice can carry.
+        self.assertEqual([m for m, _, _ in self.sends], ["send_audio", "send_audio"])
+        self.assertEqual([k["file_name"] for _, _, k in self.sends], ["voice_part1of2.m4a", "voice_part2of2.m4a"])
+
+    async def test_prepared_paths_are_used_and_left_for_the_caller(self):
+        src = self._file("movie.mp4", 5000)
+        parts = [self._file(f"prepared_{i}.mp4", 900) for i in range(2)]
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock()) as fit:
+            sent_id = await self.platform.send_file(-5, src, ".mp4", "Alice", prepared_paths=parts)
+        fit.assert_not_awaited()
+        self.assertEqual(sent_id, 100)
+        self.assertEqual(len(self.sends), 2)
+        for part in parts:
+            self.assertTrue(os.path.isfile(part))
+
+    async def test_internal_media_parts_are_labelled_without_attribution(self):
+        src = self._file("post.mp4", 5000)
+        parts = [self._file(f"prepared_{i}.mp4", 900) for i in range(2)]
+        await self.platform.send_file(-5, src, ".mp4", "bridge", trusted_internal=True, prepared_paths=parts)
+        self.assertEqual([k["caption"] for _, _, k in self.sends], ["(part 1/2)", "(part 2/2)"])
+
+    async def test_unfittable_file_sends_escaped_notice(self):
+        src = self._file("a&b archive.zip", 5000)  # "&" must not reach Telegram's HTML parser raw
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=None)):
+            sent_id = await self.platform.send_file(-5, src, ".zip", "Alice", reply_to_native_id=9)
+        self.assertIsNone(sent_id)
+        ((method, args, kwargs),) = self.sends
+        self.assertEqual(method, "send_message")
+        self.assertIn("couldn't be compressed or split", args[1])
+        self.assertIn("[a&amp;b archive.zip]", args[1])
+        self.assertTrue(args[1].startswith("<b>Alice:</b> "))
+        self.assertEqual(kwargs["reply_to_message_id"], 9)
+
+    async def test_failure_midway_keeps_the_first_message_id(self):
+        src = self._file("movie.mp4", 5000)
+        parts = [self._file(f"bridge_xcode_{i}.mp4", 900) for i in range(3)]
+        ok = self.app.send_video.side_effect
+        calls = 0
+
+        async def _flaky(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2: raise RuntimeError("network down")
+            return await ok(*args, **kwargs)
+
+        self.app.send_video = AsyncMock(side_effect=_flaky)
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=list(parts))), \
+                self.assertLogs("bridge.telegram", level="ERROR") as logs:
+            sent_id = await self.platform.send_file(-5, src, ".mp4", "Alice")
+        self.assertEqual(sent_id, 100)   # part 1 went out, so replies can still map to it
+        self.assertEqual(calls, 2)       # part 3 is not attempted after part 2 fails
+        self.assertIn("after 1 of 3 part(s)", logs.output[0])
+        for part in parts:
+            self.assertFalse(os.path.exists(part))
+
+    async def test_prepare_file_reports_fit_split_and_failure(self):
+        small = self._file("ok.mp4", 500)
+        big = self._file("big.mp4", 5000)
+        parts = [self._file(f"bridge_xcode_{i}.mp4", 900) for i in range(2)]
+        self.assertEqual(await self.platform.prepare_file(-5, small, ".mp4"), [small])
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=list(parts))):
+            self.assertEqual(await self.platform.prepare_file(-5, big, ".mp4"), parts)
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(return_value=None)):
+            self.assertEqual(await self.platform.prepare_file(-5, big, ".mp4"), [])
+
+    async def test_bridge_overrides_limit_and_split_parts(self):
+        self.platform._bridge_for_chat = {-5: "b"}
+        self.platform._bridge_by_name = {"b": {"name": "b", "destination_size_limit_mb": 2000, "max_split_parts": 1}}
+        src = self._file("clip.mp4", 5000)
+        self.assertEqual(self.platform._file_limits_for_chat(-5), (2000 * MB, 1))
+        self.assertEqual(await self.platform.prepare_file(-5, src, ".mp4"), [src])
+
+    async def test_upload_indicator_shown_while_encoding_and_never_fatal(self):
+        src = self._file("big.mp4", 5000)
+        part = self._file("bridge_xcode_0.mp4", 900)
+
+        async def _slow_fit(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return [part]
+
+        with patch.object(self.mod, "fit_to_limit", new=AsyncMock(side_effect=_slow_fit)):
+            self.assertEqual(await self.platform.prepare_file(-5, src, ".mp4"), [part])
+            self.app.send_chat_action.assert_awaited()
+            self.assertEqual(self.app.send_chat_action.await_args.args[0], -5)
+            # A chat that rejects chat actions must not break the fitting.
+            self.app.send_chat_action = AsyncMock(side_effect=RuntimeError("CHAT_WRITE_FORBIDDEN"))
+            self.assertEqual(await self.platform.prepare_file(-5, src, ".mp4"), [part])
+
+
 if __name__ == "__main__":
     unittest.main()

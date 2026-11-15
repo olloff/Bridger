@@ -69,6 +69,13 @@ platforms:
     # without download (DoS guard) — raise the limit if that bites.
     # destination_size_limit_mb: 50
 
+    # Optional: how many parts an oversized video/audio may be split into
+    # when a single re-encoded file would be unwatchable at this chat's
+    # limit — same behavior as discord.max_split_parts below. Parts are
+    # sent as consecutive "(part 1/N)" messages. Set 1 to never split.
+    # Default 10, max 30. Per-bridge overridable.
+    # max_split_parts: 10
+
     # Optional: voice-message transcription for THIS platform. Two output
     # toggles, each independent:
     #   reply_with_transcript  — on a voice note arrival, the bot replies
@@ -182,8 +189,9 @@ platforms:
 #    upload limit for THIS bridge specifically. Useful when one Discord
 #    target is on a boosted server (50/100 MB) and another isn't (10 MB),
 #    or when Nitro vs. non-Nitro recipients need different caps.
-#  - max_split_parts: replaces the Discord platform's max_split_parts for
-#    THIS bridge (1 = never split oversized media into parts).
+#  - max_split_parts: replaces the destination platform's (Discord /
+#    Telegram) max_split_parts for THIS bridge (1 = never split oversized
+#    media into parts).
 #  - digest: see the dedicated example below.
 #
 # Filter gating model (per bridge):

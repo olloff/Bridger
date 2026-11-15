@@ -3,6 +3,7 @@ Telegram platform — receives messages from Telegram and sends to Telegram.
 """
 
 import asyncio
+import contextlib
 import html
 import os
 from pyrogram import Client, enums, types
@@ -14,11 +15,12 @@ from bridge.utils.config import (
     normalize_user_ids, parse_upload_limit_mb,
     effective_mention_filters, effective_always_forward_user_ids,
     effective_destination_size_limit_bytes,
+    effective_max_split_parts, parse_max_split_parts,
     bridge_digest_config, platform_voice_transcription_config,
 )
 from bridge.transcription import get_transcriber, transcription_slot
 from bridge.utils.media import classify_attachment, get_unique_filepath, safe_basename
-from bridge.utils.transcode import compress_to_fit
+from bridge.utils.transcode import fit_to_limit
 from bridge.utils.logger import get_logger, safe_for_log
 
 DEFAULT_DESTINATION_SIZE_LIMIT_MB = 50  # Telegram bot API hard cap when this platform is the bridge destination
@@ -36,6 +38,28 @@ logger = get_logger("telegram")
 _processed_media_groups: set[str] = set()
 
 MESSAGE_CHUNK_LIMIT = 1800
+
+# Telegram clears a chat action after ~5 s, so it is re-sent while work continues.
+_CHAT_ACTION_INTERVAL = 4.0
+
+
+@contextlib.asynccontextmanager
+async def _upload_action(app, chat_id):
+    """Show "sending video…" in *chat_id* for the duration of the block.
+
+    Purely cosmetic feedback while a long transcode runs, so any failure
+    (no permission, flood limit, unknown chat) just ends the indicator."""
+    async def _pulse() -> None:
+        try:
+            while True:
+                await app.send_chat_action(chat_id, enums.ChatAction.UPLOAD_VIDEO)
+                await asyncio.sleep(_CHAT_ACTION_INTERVAL)
+        except asyncio.CancelledError: raise
+        except Exception: return
+
+    task = asyncio.create_task(_pulse())
+    try: yield
+    finally: task.cancel()
 
 def _format_user_name(user, fallback: str) -> str:
     """Render a Pyrogram User object as a display name."""
@@ -166,6 +190,8 @@ class TelegramPlatform(BasePlatform):
         self._destination_size_limit_bytes = parse_upload_limit_mb(platform_config.get("destination_size_limit_mb"), DEFAULT_DESTINATION_SIZE_LIMIT_MB)
         logger.info("Telegram destination size limit: %d bytes (%.1f MB)",
                     self._destination_size_limit_bytes, self._destination_size_limit_bytes / (1024 * 1024))
+        self._max_split_parts = parse_max_split_parts(platform_config.get("max_split_parts"))
+        logger.info("Telegram max split parts for oversized media: %d", self._max_split_parts)
 
         session_workdir = platform_media_dir(self.name)
         if bot_token: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token, workdir=session_workdir)
@@ -223,6 +249,10 @@ class TelegramPlatform(BasePlatform):
         if new_limit != self._destination_size_limit_bytes:
             logger.info("Telegram destination size limit updated: %d → %d bytes", self._destination_size_limit_bytes, new_limit)
             self._destination_size_limit_bytes = new_limit
+        new_parts = parse_max_split_parts(platform_config.get("max_split_parts"))
+        if new_parts != self._max_split_parts:
+            logger.info("Telegram max split parts updated: %d → %d", self._max_split_parts, new_parts)
+            self._max_split_parts = new_parts
 
     def _register_handlers(self) -> None:
         """Wire up Pyrogram event handlers.
@@ -659,55 +689,128 @@ class TelegramPlatform(BasePlatform):
     async def send_file(
         self, chat_id, file_path: str, file_ext: str, sender: str,
         reply_to_native_id=None, *, trusted_internal: bool = False,
+        prepared_paths: list[str] | None = None,
     ) -> int | None:
-        bridge = self.bridge_name_for_chat(chat_id)
-        # HTML-escape the user-supplied sender name; same rationale as in send_text.
-        caption = "" if trusted_internal else f"<b>{html.escape(sender)}:</b>"
+        """Upload *file_path*, shrinking it first if it exceeds the limit.
 
-        actual_path = file_path
-        transcoded_path: str | None = None
-        original_size = os.path.getsize(file_path)
-        # Resolve bridge-effective destination size limit so per-bridge
-        # overrides of destination_size_limit_mb apply (e.g. boosted Discord
-        # server vs. unboosted, or different Telegram chats with different
-        # quotas).
-        bridge_dict = self.find_bridge_by_name(bridge) or {} if bridge else {}
-        limit = effective_destination_size_limit_bytes(bridge_dict, self._destination_size_limit_bytes)
+        Oversized media is re-encoded with lowered settings; if one file
+        still can't carry it at a watchable quality it is split and sent as
+        consecutive "part i/N" messages. Returns the ID of the first
+        message (the one replies should map to).
 
-        if original_size > limit:
-            transcoded_path = await compress_to_fit(file_path, target_bytes=limit)
-            if transcoded_path:
-                new_size = os.path.getsize(transcoded_path)
-                logger.info(
-                    "Transcoded %s (%.2f MB → %.2f MB) to fit Telegram destination size limit",
-                    os.path.basename(file_path),
-                    original_size / (1024 * 1024), new_size / (1024 * 1024),
-                )
-                actual_path = transcoded_path
-            else:
-                limit_mb = limit // (1024 * 1024)
-                msg = f"File is {original_size / (1024 * 1024):.1f} MB, over the {limit_mb} MB limit, and couldn't be transcoded."
-                text = msg if trusted_internal else f"<b>{html.escape(sender)}:</b> {html.escape(msg)}"
-                await self._app.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-                return None
-
-        attachment_kind = classify_attachment(actual_path, file_ext)
-        sent_msg = None
+        *prepared_paths* is the result of an earlier :meth:`prepare_file`
+        call (owned and cleaned up by that caller). Without it the fitting
+        happens here."""
+        limit, max_parts = self._file_limits_for_chat(chat_id)
+        own: list[str] = []  # temp files created by THIS call
+        sent_ids: list = []
+        paths = prepared_paths
         try:
-            if attachment_kind == "photo": sent_msg = await self._app.send_photo(chat_id, actual_path, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to_native_id)
-            elif attachment_kind == "video": sent_msg = await self._app.send_video(chat_id, actual_path, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to_native_id)
-            elif attachment_kind == "audio": sent_msg = await self._app.send_audio(chat_id, actual_path, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to_native_id)
-            elif attachment_kind == "voice": sent_msg = await self._app.send_voice(chat_id, actual_path, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to_native_id)
-            else: sent_msg = await self._app.send_document(chat_id, actual_path, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to_native_id)
+            if paths is None:
+                paths = await self._fit_paths(chat_id, file_path, limit, max_parts)
+                own = [p for p in paths if p != file_path]
+            if not paths:
+                await self._send_too_large_notice(chat_id, file_path, limit, sender, reply_to_native_id, trusted_internal)
+                return None
+            await self._upload_paths(chat_id, paths, file_path, file_ext, sender, reply_to_native_id, trusted_internal, sent_ids)
         except Exception as exc:
-            logger.error("Telegram send_file to %s failed: %s", chat_id, exc, exc_info=True)
-            return None
+            if sent_ids:
+                logger.error(
+                    "Telegram send_file to %s failed after %d of %d part(s): %s",
+                    chat_id, len(sent_ids), len(paths or ()), exc, exc_info=True,
+                )
+            else:
+                logger.error("Telegram send_file to %s failed: %s", chat_id, exc, exc_info=True)
         finally:
-            if transcoded_path:
-                try: os.remove(transcoded_path)
+            for path in own:
+                try: os.remove(path)
                 except OSError: pass
 
-        return sent_msg.id if sent_msg else None
+        return sent_ids[0] if sent_ids else None
+
+    def _file_limits_for_chat(self, chat_id) -> tuple[int, int]:
+        """Bridge-effective ``(upload limit in bytes, max split parts)`` so
+        per-bridge overrides apply (e.g. Telegram chats with different
+        quotas, bot vs. userbot limits)."""
+        bridge_name = self.bridge_name_for_chat(chat_id)
+        bridge = (self.find_bridge_by_name(bridge_name) or {}) if bridge_name else {}
+        return (
+            effective_destination_size_limit_bytes(bridge, self._destination_size_limit_bytes),
+            effective_max_split_parts(bridge, self._max_split_parts),
+        )
+
+    async def _fit_paths(self, chat_id, file_path: str, limit: int, max_parts: int) -> list[str]:
+        """Return the file(s) to upload for *file_path* under *limit*.
+
+        ``[file_path]`` when it already fits; otherwise freshly transcoded
+        file(s) — one compressed copy, or several parts when a single copy
+        would be unwatchable; ``[]`` when it can't be made to fit."""
+        original_size = os.path.getsize(file_path)
+        if original_size <= limit: return [file_path]
+        async with _upload_action(self._app, chat_id):
+            parts = await fit_to_limit(file_path, limit, max_parts=max_parts)
+        if not parts: return []
+        logger.info(
+            "Transcoded %s (%.2f MB) into %d file(s) totalling %.2f MB to fit the %.1f MB Telegram limit",
+            os.path.basename(file_path), original_size / (1024 * 1024), len(parts),
+            sum(os.path.getsize(p) for p in parts) / (1024 * 1024), limit / (1024 * 1024),
+        )
+        return parts
+
+    async def prepare_file(self, chat_id, file_path: str, file_ext: str) -> list[str] | None:
+        """Compress / split *file_path* to fit this chat's upload limit.
+
+        Called by the router outside the per-destination lock — see
+        :meth:`BasePlatform.prepare_file`."""
+        limit, max_parts = self._file_limits_for_chat(chat_id)
+        return await self._fit_paths(chat_id, file_path, limit, max_parts)
+
+    async def _upload_paths(self, chat_id, paths: list[str], file_path: str, file_ext: str, sender: str,
+                            reply_to_native_id, trusted_internal: bool, sent_ids: list) -> None:
+        """Send *paths* in order, one message each, appending every sent
+        message ID to *sent_ids* (so the caller knows how far it got)."""
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        total = len(paths)
+        # HTML-escape the user-supplied sender name; same rationale as in send_text.
+        attribution = "" if trusted_internal else f"<b>{html.escape(sender)}:</b>"
+        for index, path in enumerate(paths, start=1):
+            if path == file_path:
+                kind, file_name = classify_attachment(path, file_ext), None
+            else:
+                # A transcoded file is classified by its OWN container (an
+                # oversized .ogg voice note comes back as .m4a audio), and is
+                # shown under the original name rather than the temp one.
+                ext = os.path.splitext(path)[1]
+                kind = classify_attachment(path, ext)
+                file_name = f"{stem}_part{index}of{total}{ext}" if total > 1 else f"{stem}{ext}"
+            caption = f"{attribution} (part {index}/{total})".strip() if total > 1 else attribution
+            kwargs = {
+                "caption": caption, "parse_mode": ParseMode.HTML,
+                # Only the first part replies; the rest simply follow it.
+                "reply_to_message_id": reply_to_native_id if index == 1 else None,
+            }
+            if kind == "photo": sent = await self._app.send_photo(chat_id, path, **kwargs)
+            elif kind == "voice": sent = await self._app.send_voice(chat_id, path, **kwargs)
+            else:
+                if file_name: kwargs["file_name"] = file_name
+                if kind == "video": sent = await self._app.send_video(chat_id, path, **kwargs)
+                elif kind == "audio": sent = await self._app.send_audio(chat_id, path, **kwargs)
+                else: sent = await self._app.send_document(chat_id, path, **kwargs)
+            if sent is not None: sent_ids.append(sent.id)
+
+    async def _send_too_large_notice(self, chat_id, file_path: str, limit: int, sender: str,
+                                     reply_to_native_id, trusted_internal: bool) -> None:
+        try: size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        except OSError: size_mb = 0.0
+        # Only the file name is user-controlled; the rest is fixed text.
+        msg = (
+            f"[{html.escape(os.path.basename(file_path))}] is {size_mb:.1f} MB — over the "
+            f"{limit / (1024 * 1024):g} MB limit, and it couldn't be compressed or split to fit."
+        )
+        text = msg if trusted_internal else f"<b>{html.escape(sender)}:</b> {msg}"
+        await self._app.send_message(
+            chat_id, text, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to_native_id,
+        )
 
     # Lifecycle
     async def start(self) -> None:

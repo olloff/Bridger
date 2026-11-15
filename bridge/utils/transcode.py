@@ -223,6 +223,9 @@ async def fit_to_limit(file_path: str, limit_bytes: int, *,
 async def compress_to_fit(file_path: str, target_bytes: int) -> str | None:
     """Produce a single transcoded copy of *file_path* under *target_bytes*.
 
+    Convenience wrapper for callers that can only send one file; the
+    platforms themselves use :func:`fit_to_limit`.
+
     Returns the new file's path on success, or ``None`` if the file isn't a
     supported format, ffmpeg isn't available, or the result can't fit."""
     parts = await fit_to_limit(file_path, target_bytes, max_parts=1)
