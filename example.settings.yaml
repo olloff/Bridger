@@ -133,6 +133,16 @@ platforms:
     # value is refused without download (DoS guard).
     # destination_size_limit_mb: 10
 
+    # Optional: what to do with video/audio that is STILL too big for one
+    # upload after lowering the quality. The bridge first re-encodes with
+    # reduced settings (bitrate, then resolution 1080p → 720p → 480p →
+    # 360p, frame rate, audio bitrate). If a single file would have to
+    # drop below ~360p / 300 kbps to fit, it is instead split into up to
+    # this many parts, each under the limit, posted as consecutive
+    # "(part 1/N)" messages. Set 1 to never split (one compressed file or
+    # a "too large" notice). Default 10, max 30. Per-bridge overridable.
+    # max_split_parts: 10
+
     # Optional: voice-message transcription for THIS platform — same
     # schema as Telegram's voice_transcription above. Discord voice
     # messages are detected via attachment.duration_secs (only present
@@ -172,6 +182,8 @@ platforms:
 #    upload limit for THIS bridge specifically. Useful when one Discord
 #    target is on a boosted server (50/100 MB) and another isn't (10 MB),
 #    or when Nitro vs. non-Nitro recipients need different caps.
+#  - max_split_parts: replaces the Discord platform's max_split_parts for
+#    THIS bridge (1 = never split oversized media into parts).
 #  - digest: see the dedicated example below.
 #
 # Filter gating model (per bridge):

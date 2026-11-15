@@ -41,6 +41,13 @@ class Router:
             self._send_timeout = max(5.0, float(os.environ.get("BRIDGER_SEND_TIMEOUT", "120")))
         except ValueError:
             self._send_timeout = 120.0
+        # Budget for a destination's prepare_file hook (transcode / split of
+        # oversized media). Runs outside the per-destination lock, so it
+        # gets its own, much longer, deadline than a network send.
+        try:
+            self._prepare_timeout = max(30.0, float(os.environ.get("BRIDGER_PREPARE_TIMEOUT", "900")))
+        except ValueError:
+            self._prepare_timeout = 900.0
         try:
             dispatch_concurrency = max(1, int(os.environ.get("BRIDGER_DISPATCH_CONCURRENCY", "32")))
         except ValueError:
@@ -87,7 +94,7 @@ class Router:
                 target_platform, target_msg_id, sender=sender,
             )
 
-    async def _ordered_target_call(self, target_name: str, chat_id, operation):
+    async def _ordered_target_call(self, target_name: str, chat_id, operation, timeout: float | None = None):
         key = (target_name, str(chat_id))
         lock = self._destination_locks.setdefault(key, asyncio.Lock())
 
@@ -98,7 +105,7 @@ class Router:
 
         # The timeout covers queueing as well as network work, preventing an
         # unavailable destination from accumulating waiters forever.
-        return await asyncio.wait_for(_bounded(), timeout=self._send_timeout)
+        return await asyncio.wait_for(_bounded(), timeout=timeout or self._send_timeout)
 
     # Helpers
     def _other_platforms_in_bridge(self, bridge: dict, source_name: str):
@@ -235,19 +242,45 @@ class Router:
 
         # Modes 1 & 2: immediate fan-out
         async def _send_file_one(tgt_name, chat_id, tgt_platform):
+            prepared: list[str] | None = None
+
             async def _operation():
                 reply_native_id = None
                 if replied_to_msg_id is not None:
                     reply_native_id = await self._resolve_native_id(
                         bridge_name, source_platform, replied_to_msg_id, tgt_name,
                     )
+                extra = {} if prepared is None else {"prepared_paths": prepared}
                 return await tgt_platform.send_file(
                     chat_id, file_path, file_ext, sender,
                     reply_to_native_id=reply_native_id,
                     trusted_internal=False,
+                    **extra,
                 )
             try:
-                sent_id = await self._ordered_target_call(tgt_name, chat_id, _operation)
+                # Phase 1 — slow, CPU-bound fitting (transcode / split) runs
+                # OUTSIDE the destination lock: a multi-minute encode must
+                # not stall, or time out, the messages queued behind it.
+                prepare = getattr(tgt_platform, "prepare_file", None)
+                if prepare is not None:
+                    try:
+                        prepared = await asyncio.wait_for(
+                            prepare(chat_id, file_path, file_ext), timeout=self._prepare_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        # [] = "couldn't be made to fit": the platform posts
+                        # its too-large notice instead of silently dropping.
+                        logger.warning(
+                            "Preparing %s for %s:%s exceeded %.0fs — giving up on fitting it",
+                            os.path.basename(file_path), tgt_name, chat_id, self._prepare_timeout,
+                        )
+                        prepared = []
+                # Phase 2 — the upload itself, ordered per destination. A
+                # split file is several uploads, so scale the deadline.
+                sent_id = await self._ordered_target_call(
+                    tgt_name, chat_id, _operation,
+                    timeout=self._send_timeout * max(1, len(prepared or ())),
+                )
                 if sent_id is None or not save_mapping:
                     return None
                 return (bridge_name, source_platform, source_msg_id, tgt_name, sent_id, sender)
@@ -257,6 +290,12 @@ class Router:
                     exc_info=True,
                 )
                 return None
+            finally:
+                # Transcoder output belongs to this dispatch, not the platform.
+                for path in prepared or ():
+                    if path != file_path:
+                        try: os.remove(path)
+                        except OSError: pass
 
         jobs = [
             _send_file_one(tgt_name, chat_id, tgt_platform)

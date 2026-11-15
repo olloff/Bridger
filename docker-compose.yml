@@ -48,6 +48,10 @@ services:
       - BRIDGER_YTDLP_CONCURRENCY=${BRIDGER_YTDLP_CONCURRENCY:-2}
       - BRIDGER_TRANSCODE_CONCURRENCY=${BRIDGER_TRANSCODE_CONCURRENCY:-2}
       - BRIDGER_SEND_TIMEOUT=${BRIDGER_SEND_TIMEOUT:-120}
+      # Oversized-media fitting (transcode / split): per-ffmpeg-run bound,
+      # and the overall budget for preparing one file for one destination.
+      - BRIDGER_FFMPEG_TIMEOUT=${BRIDGER_FFMPEG_TIMEOUT:-300}
+      - BRIDGER_PREPARE_TIMEOUT=${BRIDGER_PREPARE_TIMEOUT:-900}
       - BRIDGER_DISPATCH_CONCURRENCY=${BRIDGER_DISPATCH_CONCURRENCY:-32}
 
     logging:

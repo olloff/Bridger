@@ -78,7 +78,7 @@ def _get_media_size(msg: types.Message) -> int | None:
     Returns None when the message has no media or the size attribute isn't
     populated (some sticker/voice variants). Used pre-download to refuse
     obviously-too-big files without spending bandwidth on them."""
-    for attr in ("document", "video", "audio", "voice", "photo", "sticker", "animation"):
+    for attr in _DOWNLOADABLE_MEDIA:
         media = getattr(msg, attr, None)
         if media is None: continue
         size = getattr(media, "file_size", None)
@@ -86,22 +86,69 @@ def _get_media_size(msg: types.Message) -> int | None:
     return None
 
 
+# Message attributes that carry a downloadable file. ``message.media`` is
+# ALSO truthy for link previews, polls, contacts, locations, dice… — none
+# of which can be downloaded — so "has an attachment" must be decided from
+# these, never from ``message.media`` alone.
+_DOWNLOADABLE_MEDIA = ("document", "video", "animation", "audio", "voice", "video_note", "photo", "sticker")
+
+_AUDIO_MIME_EXTS = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/flac": ".flac",
+    "audio/x-flac": ".flac", "audio/wav": ".wav", "audio/x-wav": ".wav",
+}
+_AUDIO_NAME_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".amr"}
+
+
+def _has_downloadable_media(msg: types.Message) -> bool:
+    return any(getattr(msg, attr, None) for attr in _DOWNLOADABLE_MEDIA)
+
+
 def _get_media_info(msg: types.Message) -> tuple[str, str]:
     """Return ``(file_name, file_extension)`` from a Pyrogram message.
 
-    The document branch sanitizes the user-supplied ``file_name`` through
+    The extension has to describe what Telegram actually stores, because
+    the destination picks its player (and the transcoder its strategy)
+    from it: photos are JPEG, voice notes are OGG/Opus, GIFs ("animations")
+    and round video notes are MP4. A wrong or missing extension shows up
+    on Discord as a file that won't preview or play inline.
+
+    User-supplied ``file_name`` values are sanitized through
     :func:`safe_basename` so a malicious sender cannot inject path-traversal
     sequences into the eventual write path."""
-    if msg.document:
+    if getattr(msg, "document", None):
         raw = msg.document.file_name or "document"
         name, ext = os.path.splitext(raw)
         return safe_basename(name, fallback="document"), ext  # ext gets re-sanitized downstream
-    if msg.photo: return "image", ".png"
-    if msg.video: return "video", ".mp4"
-    if msg.audio: return "audio", ".mp3"
-    if msg.voice: return "voice", ".mp3"
-    if msg.sticker: return "sticker", ".webp"
+    if getattr(msg, "photo", None): return "image", ".jpg"
+    if getattr(msg, "video", None): return "video", ".mp4"
+    if getattr(msg, "animation", None): return "animation", ".mp4"
+    if getattr(msg, "video_note", None): return "video_note", ".mp4"
+    if getattr(msg, "audio", None):
+        raw = getattr(msg.audio, "file_name", None)
+        raw = raw if isinstance(raw, str) else ""
+        name, ext = os.path.splitext(raw)
+        ext = ext.lower()
+        if ext not in _AUDIO_NAME_EXTS:
+            mime = getattr(msg.audio, "mime_type", None)
+            ext = _AUDIO_MIME_EXTS.get(mime.lower() if isinstance(mime, str) else "", ".mp3")
+        return safe_basename(name, fallback="audio"), ext
+    if getattr(msg, "voice", None): return "voice", ".ogg"
+    if getattr(msg, "sticker", None):
+        # Stickers come in three containers; only static ones are WebP.
+        if getattr(msg.sticker, "is_video", False) is True: return "sticker", ".webm"
+        if getattr(msg.sticker, "is_animated", False) is True: return "sticker", ".tgs"
+        return "sticker", ".webp"
     return "file", ""
+
+
+def _album_caption(items) -> str | None:
+    """The caption of an album — Telegram stores it on ONE item, usually
+    but not always the first."""
+    for item in items or []:
+        caption = getattr(item, "caption", None)
+        if caption: return caption
+    return None
 
 class TelegramPlatform(BasePlatform):
     """Pyrogram-based Telegram bridge platform."""
@@ -433,16 +480,24 @@ class TelegramPlatform(BasePlatform):
                     self.name, bridge_name, message.id,
                     file_path, file_type, sender,
                     replied_to_msg_id=message.reply_to_message_id,
+                    source_ts=source_ts,
                 )
-            if message.caption and not is_mention_only(message.caption.lower(), eff_filters):
+            # The handler fires for whichever album item arrives first, which
+            # isn't necessarily the one holding the caption.
+            caption = message.caption or _album_caption(media_group)
+            if caption and not is_mention_only(caption.lower(), eff_filters):
                 await self.router.on_message(
                     self.name, bridge_name, message.id,
-                    message.caption, sender,
+                    caption, sender,
                     replied_to_msg_id=message.reply_to_message_id,
+                    source_ts=source_ts,
                 )
 
-        # Single attachment
-        elif message.media:
+        # Single attachment. Keyed on a DOWNLOADABLE attachment rather than
+        # ``message.media``, which is also set for link previews, polls,
+        # locations… — those have nothing to download and must fall through
+        # to the text branch instead of being dropped as a failed download.
+        elif _has_downloadable_media(message):
             cap = self._incoming_cap_for(bridge)
             size = _get_media_size(message) or 0
             if size > cap:
@@ -509,6 +564,7 @@ class TelegramPlatform(BasePlatform):
                     self.name, bridge_name, message.id,
                     message.caption, sender,
                     replied_to_msg_id=message.reply_to_message_id,
+                    source_ts=source_ts,
                 )
             # Bridge a transcript companion right after the voice file
             # (only set when bridge_with_transcript is on and we got text).
@@ -520,11 +576,17 @@ class TelegramPlatform(BasePlatform):
                     source_ts=source_ts,
                 )
 
-        # Plain text
+        # Plain text (including messages whose only "media" is a link
+        # preview). Service messages, polls, etc. carry no text — skip them
+        # rather than dispatching ``None``.
         else:
+            text = message.text or message.caption
+            if not text:
+                logger.debug("Telegram message %s has no text or downloadable media — nothing to bridge", message.id)
+                return
             await self.router.on_message(
                 self.name, bridge_name, message.id,
-                message.text, sender,
+                text, sender,
                 replied_to_msg_id=message.reply_to_message_id,
                 source_ts=source_ts,
             )

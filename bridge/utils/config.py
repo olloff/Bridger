@@ -243,6 +243,32 @@ def effective_destination_size_limit_bytes(bridge: dict, platform_default_bytes:
     return platform_default_bytes
 
 
+DEFAULT_MAX_SPLIT_PARTS = 10
+MAX_SPLIT_PARTS_CEILING = 30
+
+
+def parse_max_split_parts(value, default: int = DEFAULT_MAX_SPLIT_PARTS) -> int:
+    """Parse a YAML ``max_split_parts`` value.
+
+    The number of files an oversized video/audio may be split into when a
+    single re-encoded file would be unwatchably low quality. ``1`` (or
+    ``0`` / ``false``) disables splitting — the bridge then only ever
+    produces one compressed file. Clamped to 1..30; falls back to
+    *default* on missing / invalid input."""
+    if value is None: return default
+    if value is False: return 1
+    try: parts = int(value)
+    except (TypeError, ValueError): return default
+    return min(max(parts, 1), MAX_SPLIT_PARTS_CEILING)
+
+
+def effective_max_split_parts(bridge: dict, platform_default: int) -> int:
+    """Resolve ``max_split_parts`` for a *bridge* (bridge-level key wins)."""
+    if "max_split_parts" in bridge:
+        return parse_max_split_parts(bridge["max_split_parts"], default=platform_default)
+    return platform_default
+
+
 def effective_always_forward_user_ids(bridge: dict, platform_default) -> set[int]:
     """Resolve always-forward user IDs for a *bridge*.
 

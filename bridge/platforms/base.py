@@ -82,6 +82,28 @@ class BasePlatform(ABC):
         if sending failed.
         """
 
+    async def prepare_file(self, chat_id, file_path: str, file_ext: str) -> list[str] | None:
+        """Optional slow pre-processing for an outbound file (transcode /
+        split to fit this platform's upload limit).
+
+        The router calls this **before** taking the per-destination
+        ordering lock, so a multi-minute encode never blocks — or times
+        out — the text messages queued behind it. The result is handed
+        back to :meth:`send_file` as ``prepared_paths``:
+
+        * ``None``  — nothing to prepare; ``send_file`` is called as usual
+          (the default, and what platforms without this hook return).
+        * ``[...]`` — the files to upload instead, in order. May be just
+          ``[file_path]`` when the original already fits.
+        * ``[]``    — the file can't be made to fit; ``send_file`` posts a
+          "too large" notice.
+
+        Paths other than *file_path* are temporary and are deleted by the
+        caller of ``prepare_file`` once the send has finished. Platforms
+        overriding this must accept ``prepared_paths`` in ``send_file``.
+        """
+        return None
+
     # Outbound text safety
     def escape_user_text(self, s: str) -> str:
         """Escape *s* for safe interpolation into this platform's outbound

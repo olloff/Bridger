@@ -3,6 +3,7 @@ Discord platform — receives messages from Discord and sends to Discord.
 """
 
 import asyncio
+import contextlib
 import os
 import random
 import re
@@ -15,14 +16,21 @@ from bridge.utils.config import (
     normalize_user_ids, parse_upload_limit_mb,
     effective_mention_filters, effective_always_forward_user_ids,
     effective_destination_size_limit_bytes,
+    effective_max_split_parts, parse_max_split_parts,
     bridge_digest_config, platform_voice_transcription_config,
 )
 from bridge.transcription import get_transcriber, transcription_slot
 from bridge.utils.media import get_unique_filepath
-from bridge.utils.transcode import compress_to_fit
+from bridge.utils.transcode import fit_to_limit
 from bridge.utils.logger import get_logger, safe_for_log
 
 DEFAULT_DESTINATION_SIZE_LIMIT_MB = 10  # Discord upload limit when this platform is the bridge destination
+
+# Discord's baseline per-file limit (unboosted server). If an upload is
+# rejected with 413 while a larger limit is configured — the server lost a
+# boost tier, or the setting was simply optimistic — the file is re-fitted
+# to this size and retried once.
+OVERSIZE_FALLBACK_LIMIT_BYTES = 10 * 1024 * 1024
 
 # Pre-download cap for incoming attachments (when this platform is the source).
 # Source-side attachment downloads are skipped for files larger than this
@@ -38,6 +46,27 @@ MESSAGE_CHUNK_LIMIT = 1800
 def _escape_sender(s: str) -> str:
     """Escape Discord markdown metacharacters in an attribution label."""
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", str(s))
+
+
+@contextlib.asynccontextmanager
+async def _typing(channel):
+    """Show "Bot is typing…" in *channel* for the duration of the block.
+
+    Purely cosmetic feedback while a long transcode runs, so any failure
+    (missing permission, stubbed channel) is swallowed."""
+    cm = None
+    if channel is not None:
+        try:
+            cm = channel.typing()
+            await cm.__aenter__()
+        except Exception:
+            cm = None
+    try:
+        yield
+    finally:
+        if cm is not None:
+            try: await cm.__aexit__(None, None, None)
+            except Exception: pass
 
 
 def _minimum_intents():
@@ -61,6 +90,8 @@ class DiscordPlatform(BasePlatform):
         self._destination_size_limit_bytes = parse_upload_limit_mb(platform_config.get("destination_size_limit_mb"), DEFAULT_DESTINATION_SIZE_LIMIT_MB)
         logger.info("Discord destination size limit: %d bytes (%.1f MB)",
                     self._destination_size_limit_bytes, self._destination_size_limit_bytes / (1024 * 1024))
+        self._max_split_parts = parse_max_split_parts(platform_config.get("max_split_parts"))
+        logger.info("Discord max split parts for oversized media: %d", self._max_split_parts)
         self._allowed_mentions = discord.AllowedMentions.none()
         self._bot = commands.Bot(
             command_prefix=".",
@@ -115,6 +146,10 @@ class DiscordPlatform(BasePlatform):
         if new_limit != self._destination_size_limit_bytes:
             logger.info("Discord destination size limit updated: %d → %d bytes", self._destination_size_limit_bytes, new_limit)
             self._destination_size_limit_bytes = new_limit
+        new_parts = parse_max_split_parts(platform_config.get("max_split_parts"))
+        if new_parts != self._max_split_parts:
+            logger.info("Discord max split parts updated: %d → %d", self._max_split_parts, new_parts)
+            self._max_split_parts = new_parts
 
     def _register_handlers(self) -> None:
         """Wire up discord.py event handlers."""
@@ -601,67 +636,171 @@ class DiscordPlatform(BasePlatform):
 
         return sent_msg.id if sent_msg else None
 
+    # Outbound files ------------------------------------------------------
+    def _file_limits_for_chat(self, chat_id) -> tuple[int, int]:
+        """Bridge-effective ``(upload limit in bytes, max split parts)`` so
+        per-bridge overrides apply (e.g. boosted server vs. unboosted)."""
+        bridge_name = self.bridge_name_for_chat(chat_id)
+        bridge = (self.find_bridge_by_name(bridge_name) or {}) if bridge_name else {}
+        return (
+            effective_destination_size_limit_bytes(bridge, self._destination_size_limit_bytes),
+            effective_max_split_parts(bridge, self._max_split_parts),
+        )
+
+    async def _fit_paths(self, file_path: str, limit: int, max_parts: int, channel=None) -> list[str]:
+        """Return the file(s) to upload for *file_path* under *limit*.
+
+        ``[file_path]`` when it already fits; otherwise freshly transcoded
+        file(s) — one compressed copy, or several parts when a single copy
+        would be unwatchable; ``[]`` when it can't be made to fit."""
+        original_size = os.path.getsize(file_path)
+        if original_size <= limit: return [file_path]
+        async with _typing(channel):
+            parts = await fit_to_limit(file_path, limit, max_parts=max_parts)
+        if not parts: return []
+        logger.info(
+            "Transcoded %s (%.2f MB) into %d file(s) totalling %.2f MB to fit the %.1f MB Discord limit",
+            os.path.basename(file_path), original_size / (1024 * 1024), len(parts),
+            sum(os.path.getsize(p) for p in parts) / (1024 * 1024), limit / (1024 * 1024),
+        )
+        return parts
+
+    async def prepare_file(self, chat_id, file_path: str, file_ext: str) -> list[str] | None:
+        """Compress / split *file_path* to fit this chat's upload limit.
+
+        Called by the router outside the per-destination lock — see
+        :meth:`BasePlatform.prepare_file`."""
+        limit, max_parts = self._file_limits_for_chat(chat_id)
+        return await self._fit_paths(file_path, limit, max_parts, self._bot.get_channel(chat_id))
+
+    async def _send_file_message(self, channel, path: str, upload_name: str,
+                                 content: str | None, reply_to_native_id=None) -> "discord.Message | None":
+        """Upload one file as one message, replying to *reply_to_native_id*
+        when given."""
+        def _kwargs() -> dict:
+            # A discord.File is single-use — the HTTP layer closes it when
+            # the request finishes, success or not — so every attempt gets
+            # a fresh one.
+            kwargs = {
+                "file": discord.File(path, filename=upload_name),
+                "allowed_mentions": self._allowed_mentions,
+            }
+            if content: kwargs["content"] = content
+            return kwargs
+
+        if reply_to_native_id:
+            try:
+                # fail_if_not_exists=False: if the reply target was deleted,
+                # Discord posts a plain message instead of rejecting the upload.
+                reference = channel.get_partial_message(reply_to_native_id).to_reference(fail_if_not_exists=False)
+                return await channel.send(reference=reference, **_kwargs())
+            except discord.HTTPException as exc:
+                if getattr(exc, "status", None) == 413: raise
+                logger.info("Discord reply to %s failed (%s) — sending without reply", reply_to_native_id, exc)
+        return await channel.send(**_kwargs())
+
+    async def _upload_paths(self, channel, paths: list[str], file_path: str, sender: str,
+                            reply_to_native_id, trusted_internal: bool, sent_ids: list) -> None:
+        """Upload *paths* in order, one message each, appending every sent
+        message ID to *sent_ids* (so the caller knows how far it got)."""
+        display_name = os.path.basename(file_path)
+        stem = os.path.splitext(display_name)[0]
+        total = len(paths)
+        for index, path in enumerate(paths, start=1):
+            ext = os.path.splitext(path)[1]
+            if path == file_path: upload_name, note = display_name, ""
+            elif total == 1: upload_name, note = f"{stem}{ext}", " (compressed)"
+            else: upload_name, note = f"{stem}_part{index}of{total}{ext}", f" (part {index}/{total})"
+            if trusted_internal: content = note.strip() if total > 1 else None
+            else: content = f"*{_escape_sender(sender)}:* [{display_name}]{note}"
+            # Only the first part replies; the rest simply follow it.
+            sent = await self._send_file_message(
+                channel, path, upload_name, content,
+                reply_to_native_id if index == 1 else None,
+            )
+            if sent is not None: sent_ids.append(sent.id)
+
+    async def _send_too_large_notice(self, channel, file_path: str, limit: int, sender: str,
+                                     reply_to_native_id, trusted_internal: bool) -> None:
+        try: size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        except OSError: size_mb = 0.0
+        msg = (
+            f"[{os.path.basename(file_path)}] is {size_mb:.1f} MB — over the "
+            f"{limit / (1024 * 1024):g} MB upload limit, and it couldn't be compressed or split to fit. Sorry :("
+        )
+        text = msg if trusted_internal else f"*{_escape_sender(sender)}:* {msg}"
+        if reply_to_native_id:
+            try:
+                target_msg = channel.get_partial_message(reply_to_native_id)
+                await target_msg.reply(text, allowed_mentions=self._allowed_mentions)
+                return
+            except discord.HTTPException: pass
+        await channel.send(text, allowed_mentions=self._allowed_mentions)
+
     async def send_file(
         self, chat_id, file_path: str, file_ext: str, sender: str,
         reply_to_native_id=None, *, trusted_internal: bool = False,
+        prepared_paths: list[str] | None = None,
     ) -> int | None:
+        """Upload *file_path*, shrinking it first if it exceeds the limit.
+
+        Oversized media is re-encoded with lowered settings; if one file
+        still can't carry it at a watchable quality it is split and posted
+        as consecutive "part i/N" messages. Returns the ID of the first
+        message (the one replies should map to).
+
+        *prepared_paths* is the result of an earlier :meth:`prepare_file`
+        call (owned and cleaned up by that caller). Without it the fitting
+        happens here."""
         channel = self._bot.get_channel(chat_id)
         if channel is None:
             logger.warning("Discord channel %s not found", chat_id)
             return None
 
-        bridge = self.bridge_name_for_chat(chat_id)
-        file_name = os.path.basename(file_path)
-
-        async def _send_with_reply(content=None, file=None) -> discord.Message | None:
-            if reply_to_native_id:
-                try:
-                    target_msg = channel.get_partial_message(reply_to_native_id)
-                    return await target_msg.reply(
-                        content=content, file=file,
-                        allowed_mentions=self._allowed_mentions,
-                    )
-                except discord.HTTPException: pass
-            if content and file: return await channel.send(content=content, file=file, allowed_mentions=self._allowed_mentions)
-            elif content: return await channel.send(content=content, allowed_mentions=self._allowed_mentions)
-            elif file: return await channel.send(file=file, allowed_mentions=self._allowed_mentions)
-            return None
-
-        actual_path = file_path
-        transcoded_path: str | None = None
-        original_size = os.path.getsize(file_path)
-        # Resolve bridge-effective destination size limit so per-bridge overrides
-        # of destination_size_limit_mb apply (e.g. boosted server vs. unboosted).
-        bridge_dict = self.find_bridge_by_name(bridge) or {} if bridge else {}
-        limit = effective_destination_size_limit_bytes(bridge_dict, self._destination_size_limit_bytes)
-
-        # If over the upload limit, try to transcode media down to fit.
-        if original_size > limit:
-            transcoded_path = await compress_to_fit(file_path, target_bytes=limit)
-            if transcoded_path:
-                new_size = os.path.getsize(transcoded_path)
-                logger.info(
-                    "Transcoded %s (%.2f MB → %.2f MB) to fit Discord destination size limit",
-                    file_name, original_size / (1024 * 1024), new_size / (1024 * 1024),
-                )
-                actual_path = transcoded_path
-            else:
-                limit_mb = limit // (1024 * 1024)
-                msg = f"File is {original_size / (1024 * 1024):.1f} MB, over the {limit_mb} MB limit, and couldn't be transcoded. Sorry :("
-                text = msg if trusted_internal else f"*{_escape_sender(sender)}:* {msg}"
-                await _send_with_reply(content=text)
-                return None
-
-        sent_msg = None
+        limit, max_parts = self._file_limits_for_chat(chat_id)
+        own: list[str] = []  # temp files created by THIS call
+        paths = prepared_paths
         try:
-            if trusted_internal: sent_msg = await _send_with_reply(file=discord.File(actual_path))
-            else: sent_msg = await _send_with_reply(file=discord.File(actual_path), content=f"*{_escape_sender(sender)}:* [{file_name}]")
+            if paths is None:
+                paths = await self._fit_paths(file_path, limit, max_parts, channel)
+                own = [p for p in paths if p != file_path]
+            while True:
+                if not paths:
+                    await self._send_too_large_notice(channel, file_path, limit, sender, reply_to_native_id, trusted_internal)
+                    return None
+                sent_ids: list = []
+                try:
+                    await self._upload_paths(channel, paths, file_path, sender, reply_to_native_id, trusted_internal, sent_ids)
+                    return sent_ids[0] if sent_ids else None
+                except discord.HTTPException as exc:
+                    # 413 = Discord's real limit is lower than the configured
+                    # one. Anything else — or a failure part-way through a
+                    # multi-part post — is the router's to log.
+                    if getattr(exc, "status", None) != 413 or sent_ids: raise
+                    if limit <= OVERSIZE_FALLBACK_LIMIT_BYTES:
+                        logger.warning(
+                            "Discord rejected %s as too large at the %.1f MB limit",
+                            os.path.basename(file_path), limit / (1024 * 1024),
+                        )
+                        paths = []
+                        continue
+                    logger.warning(
+                        "Discord rejected %s as too large (configured limit %.1f MB) — refitting to %.1f MB. "
+                        "Lower destination_size_limit_mb to avoid the wasted encode.",
+                        os.path.basename(file_path), limit / (1024 * 1024),
+                        OVERSIZE_FALLBACK_LIMIT_BYTES / (1024 * 1024),
+                    )
+                    limit = OVERSIZE_FALLBACK_LIMIT_BYTES
+                    for path in own:
+                        try: os.remove(path)
+                        except OSError: pass
+                    own = []
+                    paths = await self._fit_paths(file_path, limit, max_parts, channel)
+                    own = [p for p in paths if p != file_path]
         finally:
-            if transcoded_path:
-                try: os.remove(transcoded_path)
+            for path in own:
+                try: os.remove(path)
                 except OSError: pass
-
-        return sent_msg.id if sent_msg else None
 
     # Lifecycle — backoff is linear (additive), the gentlest pattern that
     # still progresses. Each failed attempt extends the wait by INCREMENT,
