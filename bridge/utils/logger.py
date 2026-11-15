@@ -73,7 +73,8 @@ def setup_logging(*, level: int = logging.INFO, log_dir: str = "logs") -> None:
             "File logging disabled — cannot write to %s (%s). "
             "Console logging continues. If running in Docker, ensure the "
             "host directory bound to /app/logs is writable by the container "
-            "user (e.g. `chmod 777` the host logs dir).",
+            "user. Prefer matching directory ownership and mode 750; do not "
+            "make the directory world-writable.",
             log_dir, exc,
         )
 

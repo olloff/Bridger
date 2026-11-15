@@ -5,8 +5,13 @@ WhatsApp platform — receives messages from WhatsApp and sends to WhatsApp.
 import asyncio
 import os
 import mimetypes
+import time
+from collections import OrderedDict
 from bridge.platforms.base import BasePlatform
-from bridge.utils.config import platform_media_dir
+from bridge.utils.config import (
+    platform_media_dir, parse_upload_limit_mb,
+    effective_destination_size_limit_bytes,
+)
 from bridge.utils.media import classify_attachment, get_unique_filepath, safe_basename
 from bridge.utils.logger import get_logger, safe_for_log
 from neonize.aioze.client import NewAClient
@@ -22,6 +27,9 @@ logger = get_logger("whatsapp")
 
 MESSAGE_CHUNK_LIMIT = 4096  # WhatsApp's limit is much higher than TG/Discord
 FILE_SIZE_LIMIT = 64 * 1024 * 1024  # 64 MB WhatsApp media limit
+INCOMING_DOWNLOAD_FACTOR = 1  # download_any materializes the whole payload in RAM
+_SENT_ID_LIMIT = 2000
+_SENT_ID_TTL_SECONDS = 3600.0
 
 def _jid_to_str(jid) -> str:
     """Convert a neonize JID object to a comparable string like '120363...@g.us'."""
@@ -86,6 +94,31 @@ def _has_media(message: MessageEv) -> bool:
         or msg.stickerMessage.URL
     )
 
+
+def _media_payload(message: MessageEv):
+    """Return the populated protobuf media payload, if any."""
+    msg = message.Message
+    for attr in ("imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"):
+        payload = getattr(msg, attr, None)
+        if payload is not None and getattr(payload, "URL", None):
+            return payload
+    return None
+
+
+def _get_media_size(message: MessageEv) -> int | None:
+    """Best-effort protocol-reported media size without downloading it."""
+    payload = _media_payload(message)
+    if payload is None:
+        return None
+    for attr in ("fileLength", "file_length", "fileSize", "file_size"):
+        value = getattr(payload, attr, None)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
 def _get_media_info(message: MessageEv) -> tuple[str, str]:
     """Return (file_name, file_extension) for a media message."""
     msg = message.Message
@@ -124,9 +157,50 @@ class WhatsAppPlatform(BasePlatform):
         self._client = NewAClient(session_db)
         self._own_jid: str | None = None
         self._source_chats = [str(cid) for cid in self.my_chat_ids()]
-        # Track message IDs sent by the bridge to prevent echo loops
-        self._sent_ids: set[str] = set()
+        self._destination_size_limit_bytes = parse_upload_limit_mb(
+            platform_config.get("destination_size_limit_mb"), 64,
+        )
+        self._reject_unknown_media_size = bool(
+            platform_config.get("reject_unknown_media_size", True)
+        )
+        try:
+            download_concurrency = max(1, min(8, int(platform_config.get("max_concurrent_downloads", 2))))
+        except (TypeError, ValueError):
+            download_concurrency = 2
+        self._download_semaphore = asyncio.Semaphore(download_concurrency)
+        # Bounded, expiring echo tracker. OrderedDict gives O(1) oldest eviction.
+        self._sent_ids: OrderedDict[str, float] = OrderedDict()
         self._register_handlers()
+
+    def apply_config(self, platform_config: dict) -> None:
+        super().apply_config(platform_config)
+        self._destination_size_limit_bytes = parse_upload_limit_mb(
+            platform_config.get("destination_size_limit_mb"), 64,
+        )
+        self._reject_unknown_media_size = bool(
+            platform_config.get("reject_unknown_media_size", True)
+        )
+
+    def _incoming_cap_for(self, bridge: dict) -> int:
+        effective = effective_destination_size_limit_bytes(
+            bridge, self._destination_size_limit_bytes,
+        )
+        return min(effective * INCOMING_DOWNLOAD_FACTOR, FILE_SIZE_LIMIT)
+
+    def _prune_sent_ids(self) -> None:
+        cutoff = time.monotonic() - _SENT_ID_TTL_SECONDS
+        while self._sent_ids:
+            _msg_id, added = next(iter(self._sent_ids.items()))
+            if added >= cutoff and len(self._sent_ids) <= _SENT_ID_LIMIT:
+                break
+            self._sent_ids.popitem(last=False)
+
+    def _track_sent_id(self, msg_id: str | None) -> None:
+        if not msg_id:
+            return
+        self._sent_ids[msg_id] = time.monotonic()
+        self._sent_ids.move_to_end(msg_id)
+        self._prune_sent_ids()
 
     def _register_handlers(self) -> None:
         """Wire up neonize event handlers."""
@@ -161,8 +235,7 @@ class WhatsAppPlatform(BasePlatform):
 
         # Skip messages the bridge itself sent (echo prevention)
         if msg_id in self._sent_ids:
-            self._sent_ids.discard(msg_id)
-            if len(self._sent_ids) > 1000: self._sent_ids.clear()
+            self._sent_ids.pop(msg_id, None)
             return
 
         bridge_name = self._bridge_name_for_jid(chat_str)
@@ -178,31 +251,71 @@ class WhatsAppPlatform(BasePlatform):
 
         quoted_id = _get_quoted_id(message)
         media_dir = platform_media_dir(self.name)
+        bridge = self.find_bridge_by_name(bridge_name) or {}
 
         try:
             # Media
             has_media = _has_media(message)
             if has_media:
+                reported_size = _get_media_size(message)
+                cap = self._incoming_cap_for(bridge)
+                if reported_size is None and self._reject_unknown_media_size:
+                    logger.warning(
+                        "Skipping WhatsApp attachment with unknown size from %s",
+                        safe_for_log(sender),
+                    )
+                    has_media = False
+                elif reported_size is not None and reported_size > cap:
+                    logger.warning(
+                        "Skipping oversized WhatsApp attachment from %s: %.1f MB > %.1f MB cap",
+                        safe_for_log(sender), reported_size / (1024 * 1024),
+                        cap / (1024 * 1024),
+                    )
+                    has_media = False
+            if has_media:
+                file_path = None
+                handed_off = False
                 try:
                     file_name, file_ext = _get_media_info(message)
                     file_path = get_unique_filepath(media_dir, file_name, file_ext)
-                    data = await client.download_any(message.Message)
-                    with open(file_path, "wb") as f:
-                        f.write(data)
-                    logger.info("Downloaded media: %s", file_path)
-                    await self.router.on_file(
-                        self.name, bridge_name, msg_id,
-                        file_path, file_ext, sender,
-                        replied_to_msg_id=quoted_id,
+                    async with self._download_semaphore:
+                        data = await client.download_any(message.Message)
+                    if len(data) > cap:
+                        logger.warning(
+                            "WhatsApp attachment from %s downloaded %.1f MB > %.1f MB cap; discarding",
+                            safe_for_log(sender), len(data) / (1024 * 1024),
+                            cap / (1024 * 1024),
+                        )
+                        data = None
+                    if data is not None:
+                        with open(file_path, "wb") as f:
+                            f.write(data)
+                        if os.path.getsize(file_path) > cap:
+                            raise ValueError("written WhatsApp media exceeds configured cap")
+                        await self.router.on_file(
+                            self.name, bridge_name, msg_id,
+                            file_path, file_ext, sender,
+                            replied_to_msg_id=quoted_id,
+                        )
+                        handed_off = True
+                except Exception as exc:
+                    logger.warning(
+                        "Failed/refused media download from %s: %s",
+                        safe_for_log(sender), safe_for_log(exc),
                     )
-                except Exception:
-                    logger.warning("Failed to download media from %s", safe_for_log(sender), exc_info=True)
+                finally:
+                    if not handed_off and file_path and os.path.isfile(file_path):
+                        try: os.remove(file_path)
+                        except OSError: pass
 
             # Text (or caption for media)
             text = _get_text(message)
             caption = _get_caption(message)
             content = text or caption
-            logger.info("Extracted content: text=%r, caption=%r, has_media=%s", text, caption, has_media)
+            logger.debug(
+                "Extracted WhatsApp content: text_len=%d caption_len=%d has_media=%s",
+                len(text or ""), len(caption or ""), has_media,
+            )
             if content:
                 await self.router.on_message(
                     self.name, bridge_name, msg_id,
@@ -247,10 +360,13 @@ class WhatsAppPlatform(BasePlatform):
             remoteJID=jid_str,
         )
 
-    async def send_text(self, chat_id, content: str, sender: str, reply_to_native_id=None) -> str | None:
+    async def send_text(
+        self, chat_id, content: str, sender: str, reply_to_native_id=None,
+        *, trusted_internal: bool = False,
+    ) -> str | None:
         jid = self._jid_for_chat_id(chat_id)
         bridge = self.bridge_name_for_chat(chat_id)
-        text = content if sender == bridge else f"*{sender}:*\n{content}"
+        text = content if trusted_internal else f"*{sender}:*\n{content}"
 
         sent = None
         if reply_to_native_id:
@@ -265,18 +381,21 @@ class WhatsAppPlatform(BasePlatform):
             else:
                 sent = await self._client.send_message(jid, text)
 
-        if sent and sent.ID: self._sent_ids.add(sent.ID)
+        if sent and sent.ID: self._track_sent_id(sent.ID)
         return sent.ID if sent else None
 
-    async def send_file(self, chat_id, file_path: str, file_ext: str, sender: str, reply_to_native_id=None) -> str | None:
+    async def send_file(
+        self, chat_id, file_path: str, file_ext: str, sender: str,
+        reply_to_native_id=None, *, trusted_internal: bool = False,
+    ) -> str | None:
         jid = self._jid_for_chat_id(chat_id)
         bridge = self.bridge_name_for_chat(chat_id)
-        caption = "" if sender == bridge else f"*{sender}:*"
+        caption = "" if trusted_internal else f"*{sender}:*"
         attachment_kind = classify_attachment(file_path, file_ext)
 
         if os.path.getsize(file_path) > FILE_SIZE_LIMIT:
             msg = "File size is over 64MB, can't send it."
-            text = msg if sender == bridge else f"*{sender}:* {msg}"
+            text = msg if trusted_internal else f"*{sender}:* {msg}"
             await self._client.send_message(jid, text)
             return None
 
@@ -293,7 +412,7 @@ class WhatsAppPlatform(BasePlatform):
             logger.warning("Failed to send file to WhatsApp", exc_info=True)
             return None
 
-        if sent and sent.ID: self._sent_ids.add(sent.ID)
+        if sent and sent.ID: self._track_sent_id(sent.ID)
         return sent.ID if sent else None
 
     # Lifecycle

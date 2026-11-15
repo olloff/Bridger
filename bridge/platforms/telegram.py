@@ -16,7 +16,7 @@ from bridge.utils.config import (
     effective_destination_size_limit_bytes,
     bridge_digest_config, platform_voice_transcription_config,
 )
-from bridge.transcription import get_transcriber
+from bridge.transcription import get_transcriber, transcription_slot
 from bridge.utils.media import classify_attachment, get_unique_filepath, safe_basename
 from bridge.utils.transcode import compress_to_fit
 from bridge.utils.logger import get_logger, safe_for_log
@@ -120,9 +120,10 @@ class TelegramPlatform(BasePlatform):
         logger.info("Telegram destination size limit: %d bytes (%.1f MB)",
                     self._destination_size_limit_bytes, self._destination_size_limit_bytes / (1024 * 1024))
 
-        if bot_token: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
-        elif phone_number: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash, phone_number=phone_number)
-        else: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash)
+        session_workdir = platform_media_dir(self.name)
+        if bot_token: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token, workdir=session_workdir)
+        elif phone_number: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash, phone_number=phone_number, workdir=session_workdir)
+        else: self._app = Client("my_bot", api_id=api_id, api_hash=api_hash, workdir=session_workdir)
 
         self._register_handlers()
 
@@ -193,12 +194,16 @@ class TelegramPlatform(BasePlatform):
             # so reply_with_transcript also fires for voice notes that
             # would otherwise be filtered out (the common case in a busy
             # group where the filter requires a bot mention).
-            transcript = await self._maybe_transcribe(client, message)
+            vt_cfg = platform_voice_transcription_config(self.platform_config)
+            transcribe_before_filter = bool(vt_cfg and vt_cfg.get("transcribe_filtered_messages"))
+            transcript = await self._maybe_transcribe(client, message) if transcribe_before_filter else None
 
             # Digest mode: bypass all per-user / mention filters so the
             # buffered thread captures the full conversation. The router
             # decides what to do with on_message (immediate vs. buffered).
             if bridge_digest_config(bridge):
+                if not transcribe_before_filter:
+                    transcript = await self._maybe_transcribe(client, message)
                 await self._handle_incoming_message(client, message, transcript=transcript)
                 return
 
@@ -209,6 +214,8 @@ class TelegramPlatform(BasePlatform):
             sender_id = getattr(message.from_user, "id", None) if message.from_user else None
             if sender_id is not None and sender_id in eff_always_forward:
                 logger.info("Always-forward user %s — bypassing mention filter", sender_id)
+                if not transcribe_before_filter:
+                    transcript = await self._maybe_transcribe(client, message)
                 await self._handle_incoming_message(client, message, transcript=transcript)
                 return
 
@@ -229,6 +236,8 @@ class TelegramPlatform(BasePlatform):
                 if text_has_mention and not message.media and is_mention_only(text, eff_filters):
                     logger.info("Skipping mention-only message %s (no content beyond mention)", message.id)
                     return
+            if not transcribe_before_filter:
+                transcript = await self._maybe_transcribe(client, message)
             await self._handle_incoming_message(client, message, transcript=transcript)
 
         @self._app.on_message()
@@ -304,25 +313,39 @@ class TelegramPlatform(BasePlatform):
                         safe_for_log(_get_sender_name(message)), max_dur)
             return None
 
+        reported_size = int(getattr(media, "file_size", 0) or 0)
+        max_file_bytes = vt_cfg["max_file_bytes"]
+        if reported_size > max_file_bytes:
+            logger.info(
+                "Voice from %s is %.1f MB > transcription cap %.1f MB — skipping",
+                safe_for_log(_get_sender_name(message)),
+                reported_size / (1024 * 1024), max_file_bytes / (1024 * 1024),
+            )
+            return None
+
         transcriber = get_transcriber(vt_cfg)
         if transcriber is None: return None
 
         media_dir = platform_media_dir(self.name)
         os.makedirs(media_dir, exist_ok=True)
         tmp_path = get_unique_filepath(media_dir, "voice_t", ".ogg")
-        try:
-            await client.download_media(message, file_name=tmp_path)
-        except Exception as exc:
-            logger.warning("Failed to download voice for transcription: %s", exc)
-            try: os.remove(tmp_path)
-            except OSError: pass
-            return None
-
-        try:
-            transcript = await transcriber.transcribe(tmp_path, language=vt_cfg.get("language"))
-        finally:
-            try: os.remove(tmp_path)
-            except OSError: pass
+        async with transcription_slot():
+            try:
+                await client.download_media(message, file_name=tmp_path)
+                actual_size = os.path.getsize(tmp_path) if os.path.isfile(tmp_path) else 0
+                if actual_size > max_file_bytes:
+                    logger.warning(
+                        "Downloaded voice is %.1f MB > transcription cap %.1f MB — discarding",
+                        actual_size / (1024 * 1024), max_file_bytes / (1024 * 1024),
+                    )
+                    return None
+                transcript = await transcriber.transcribe(tmp_path, language=vt_cfg.get("language"))
+            except Exception as exc:
+                logger.warning("Failed to download/transcribe voice: %s", exc)
+                return None
+            finally:
+                try: os.remove(tmp_path)
+                except OSError: pass
 
         if not transcript: return None
 
@@ -529,7 +552,10 @@ class TelegramPlatform(BasePlatform):
         await self.router.on_reaction(self.name, bridge_name, msg_id, emoji, sender)
 
     # Outbound messaging
-    async def send_text(self, chat_id, content: str, sender: str, reply_to_native_id=None) -> int | None:
+    async def send_text(
+        self, chat_id, content: str, sender: str, reply_to_native_id=None,
+        *, trusted_internal: bool = False,
+    ) -> int | None:
         """Send text to a Telegram chat in HTML parse mode.
 
         For external user content (``sender != bridge_name``) we wrap in
@@ -542,11 +568,8 @@ class TelegramPlatform(BasePlatform):
         ``sender == bridge_name`` — the caller has already produced HTML-safe
         text and we send it as-is.
         """
-        bridge_name = self.bridge_name_for_chat(chat_id)
-        sender_is_bridge = sender == bridge_name
-
         def _wrap(text_chunk: str) -> str:
-            if sender_is_bridge: return text_chunk
+            if trusted_internal: return text_chunk
             return f"<b>{html.escape(sender)}:</b>\n{html.escape(text_chunk)}"
 
         sent_msg = None
@@ -571,10 +594,13 @@ class TelegramPlatform(BasePlatform):
 
         return sent_msg.id if sent_msg else None
 
-    async def send_file(self, chat_id, file_path: str, file_ext: str, sender: str, reply_to_native_id=None) -> int | None:
+    async def send_file(
+        self, chat_id, file_path: str, file_ext: str, sender: str,
+        reply_to_native_id=None, *, trusted_internal: bool = False,
+    ) -> int | None:
         bridge = self.bridge_name_for_chat(chat_id)
         # HTML-escape the user-supplied sender name; same rationale as in send_text.
-        caption = "" if sender == bridge else f"<b>{html.escape(sender)}:</b>"
+        caption = "" if trusted_internal else f"<b>{html.escape(sender)}:</b>"
 
         actual_path = file_path
         transcoded_path: str | None = None
@@ -599,7 +625,7 @@ class TelegramPlatform(BasePlatform):
             else:
                 limit_mb = limit // (1024 * 1024)
                 msg = f"File is {original_size / (1024 * 1024):.1f} MB, over the {limit_mb} MB limit, and couldn't be transcoded."
-                text = msg if sender == bridge else f"<b>{html.escape(sender)}:</b> {html.escape(msg)}"
+                text = msg if trusted_internal else f"<b>{html.escape(sender)}:</b> {html.escape(msg)}"
                 await self._app.send_message(chat_id, text, parse_mode=ParseMode.HTML)
                 return None
 
@@ -632,12 +658,13 @@ class TelegramPlatform(BasePlatform):
     def _secure_session_files(self) -> None:
         """Restrict the Pyrogram session file to owner read/write only.
 
-        ``my_bot.session`` (created by Pyrogram in CWD) holds the auth
+        ``my_bot.session`` (created in the Telegram message directory) holds the auth
         keys — anyone reading it can fully impersonate this bot. Pyrogram
         creates it with the process umask (typically ``0o644``); we
         tighten to ``0o600`` after the file exists. POSIX-only."""
         if os.name != "posix": return
-        for name in ("my_bot.session", "my_bot.session-journal"):
+        for filename in ("my_bot.session", "my_bot.session-journal"):
+            name = os.path.join(platform_media_dir(self.name), filename)
             try:
                 if os.path.isfile(name):
                     os.chmod(name, 0o600)

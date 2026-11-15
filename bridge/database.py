@@ -32,12 +32,17 @@ CREATE INDEX IF NOT EXISTS idx_target
     ON message_map (bridge_name, target_platform, target_msg_id)
 """
 
+_CREATE_INDEX_CREATED_SQL = """
+CREATE INDEX IF NOT EXISTS idx_created_at ON message_map (created_at)
+"""
+
 async def init_db(db_path: str) -> None:
     """Create the message_map table and indexes if they do not exist."""
     async with aiosqlite.connect(db_path) as db:
         await db.execute(_CREATE_MESSAGE_MAP_SQL)
         await db.execute(_CREATE_INDEX_SOURCE_SQL)
         await db.execute(_CREATE_INDEX_TARGET_SQL)
+        await db.execute(_CREATE_INDEX_CREATED_SQL)
         await db.commit()
     # Restrict to owner — bridge.db contains user activity history; mode
     # 0o644 (default umask) makes it readable to everyone with the same
@@ -46,6 +51,80 @@ async def init_db(db_path: str) -> None:
         try: os.chmod(db_path, 0o600)
         except OSError as exc: logger.warning("chmod %s failed: %s", db_path, exc)
     logger.info("Database initialized: %s", db_path)
+
+
+class MessageStore:
+    """Process-lifetime SQLite connection for the router hot path.
+
+    A single managed connection eliminates per-message connection setup and
+    lets fan-out mappings commit in one transaction. WAL is intentionally not
+    enabled here; one connection plus a short lock avoids writer contention
+    without depending on the host SQLite's WAL race-fix version.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._db = None
+        self._lock = None
+
+    async def open(self) -> "MessageStore":
+        import asyncio
+        if self._db is not None:
+            return self
+        self._db = await aiosqlite.connect(self.db_path)
+        self._lock = asyncio.Lock()
+        await self._db.execute("PRAGMA busy_timeout = 5000")
+        await self._db.execute("PRAGMA synchronous = NORMAL")
+        return self
+
+    async def close(self) -> None:
+        if self._db is not None:
+            await self._db.close()
+        self._db = None
+        self._lock = None
+
+    async def save_mappings(self, rows: list[tuple]) -> None:
+        if not rows:
+            return
+        if self._db is None:
+            await self.open()
+        created_at = int(time.time() * 1000)
+        values = [(*row, created_at) for row in rows]
+        async with self._lock:
+            await self._db.executemany(
+                "INSERT INTO message_map "
+                "(bridge_name, source_platform, source_msg_id, target_platform, target_msg_id, sender, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+            await self._db.commit()
+
+    async def resolve_native_id(self, bridge_name: str, origin_platform: str,
+                                origin_msg_id, target_platform: str):
+        if self._db is None:
+            await self.open()
+        async with self._lock:
+            async with self._db.execute(
+                "SELECT source_platform, source_msg_id FROM message_map "
+                "WHERE bridge_name = ? AND target_platform = ? AND target_msg_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (bridge_name, origin_platform, origin_msg_id),
+            ) as cur:
+                row = await cur.fetchone()
+            canonical_platform, canonical_msg_id = (
+                (row[0], row[1]) if row else (origin_platform, origin_msg_id)
+            )
+            if target_platform == canonical_platform:
+                return canonical_msg_id
+            async with self._db.execute(
+                "SELECT target_msg_id FROM message_map "
+                "WHERE bridge_name = ? AND source_platform = ? AND source_msg_id = ? "
+                "AND target_platform = ? AND target_msg_id IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (bridge_name, canonical_platform, canonical_msg_id, target_platform),
+            ) as cur:
+                target = await cur.fetchone()
+            return target[0] if target else None
 
 async def save_message_mapping(
     db_path: str,

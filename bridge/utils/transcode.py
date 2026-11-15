@@ -22,6 +22,11 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 _HEADROOM_RATIO = 0.92  # encoders overshoot bitrate; aim a bit below target
 _FFMPEG_TIMEOUT = 300.0  # seconds; bound runtime so a malicious file can't hang the bridge
 _FFPROBE_TIMEOUT = 30.0
+try:
+    _TRANSCODE_CONCURRENCY = max(1, int(os.environ.get("BRIDGER_TRANSCODE_CONCURRENCY", "2")))
+except ValueError:
+    _TRANSCODE_CONCURRENCY = 2
+_TRANSCODE_SEMAPHORE = asyncio.Semaphore(_TRANSCODE_CONCURRENCY)
 
 # Where transcoded files are written. Defaults to ``messages/transcoded/``
 # so a single docker-compose volume mapping for ``/app/messages`` covers the
@@ -58,18 +63,19 @@ async def _run(*args: str, timeout: float = _FFMPEG_TIMEOUT) -> bool:
     CPU indefinitely; the timeout guarantees the bridge stays responsive.
     On timeout the child process is killed.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("%s timed out after %.0fs — killing", args[0], timeout)
-        try: proc.kill()
-        except ProcessLookupError: pass
-        try: await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except (asyncio.TimeoutError, ProcessLookupError): pass
-        return False
+    async with _TRANSCODE_SEMAPHORE:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("%s timed out after %.0fs — killing", args[0], timeout)
+            try: proc.kill()
+            except ProcessLookupError: pass
+            try: await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, ProcessLookupError): pass
+            return False
     if proc.returncode != 0:
         logger.warning("%s failed (rc=%d): %s", args[0], proc.returncode, stderr[:500].decode("utf-8", errors="replace"))
         return False
@@ -78,20 +84,21 @@ async def _run(*args: str, timeout: float = _FFMPEG_TIMEOUT) -> bool:
 async def _probe_duration(file_path: str) -> float | None:
     if shutil.which("ffprobe") is None: return None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_FFPROBE_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("ffprobe timed out on %s — killing", file_path)
-            try: proc.kill()
-            except ProcessLookupError: pass
-            try: await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError): pass
-            return None
+        async with _TRANSCODE_SEMAPHORE:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", file_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_FFPROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("ffprobe timed out on %s — killing", file_path)
+                try: proc.kill()
+                except ProcessLookupError: pass
+                try: await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except (asyncio.TimeoutError, ProcessLookupError): pass
+                return None
         if proc.returncode != 0: return None
         return float(stdout.decode().strip())
     except (ValueError, OSError):

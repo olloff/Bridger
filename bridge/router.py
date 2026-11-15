@@ -25,14 +25,80 @@ class Router:
     *other* platform that participates in the same bridge.
     """
 
-    def __init__(self, platforms: dict[str, BasePlatform], bridges: list[dict], db_path: str, forward_reactions: bool = False):
+    def __init__(self, platforms: dict[str, BasePlatform], bridges: list[dict], db_path: str,
+                 forward_reactions: bool = False, db_store=None):
         self.platforms = platforms
         self.bridges = bridges
+        self._bridges_by_name = {b.get("name"): b for b in bridges if b.get("name")}
         self.db_path = db_path
+        self.db_store = db_store
         self.forward_reactions = forward_reactions
         # Per-(bridge_name, source_platform) digest buffers — populated
         # lazily when a bridge has digest mode enabled and a message arrives.
         self._digest_buffers: dict[tuple[str, str], _DigestBuffer] = {}
+        self._destination_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        try:
+            self._send_timeout = max(5.0, float(os.environ.get("BRIDGER_SEND_TIMEOUT", "120")))
+        except ValueError:
+            self._send_timeout = 120.0
+        try:
+            dispatch_concurrency = max(1, int(os.environ.get("BRIDGER_DISPATCH_CONCURRENCY", "32")))
+        except ValueError:
+            dispatch_concurrency = 32
+        self._dispatch_semaphore = asyncio.Semaphore(dispatch_concurrency)
+
+    def apply_bridges(self, bridges: list[dict]) -> None:
+        """Replace routing config and discard buffers for deleted bridges."""
+        self.bridges = bridges
+        self._bridges_by_name = {b.get("name"): b for b in bridges if b.get("name")}
+        valid = set(self._bridges_by_name)
+        for key, buf in list(self._digest_buffers.items()):
+            if key[0] not in valid:
+                buf.discard()
+                self._digest_buffers.pop(key, None)
+        valid_destinations = {
+            (platform, str(chat_id))
+            for bridge in bridges
+            for platform, chat_ids in bridge_targets(bridge).items()
+            for chat_id in chat_ids
+        }
+        for key, lock in list(self._destination_locks.items()):
+            if key not in valid_destinations and not lock.locked():
+                self._destination_locks.pop(key, None)
+
+    async def _resolve_native_id(self, bridge_name, source_platform, source_msg_id, target_platform):
+        if self.db_store is not None:
+            return await self.db_store.resolve_native_id(
+                bridge_name, source_platform, source_msg_id, target_platform,
+            )
+        return await database.resolve_native_id(
+            self.db_path, bridge_name, source_platform, source_msg_id, target_platform,
+        )
+
+    async def _save_mappings(self, rows: list[tuple]) -> None:
+        if not rows:
+            return
+        if self.db_store is not None:
+            await self.db_store.save_mappings(rows)
+            return
+        for bridge_name, source_platform, source_msg_id, target_platform, target_msg_id, sender in rows:
+            await database.save_message_mapping(
+                self.db_path, bridge_name, source_platform, source_msg_id,
+                target_platform, target_msg_id, sender=sender,
+            )
+
+    async def _ordered_target_call(self, target_name: str, chat_id, operation):
+        key = (target_name, str(chat_id))
+        lock = self._destination_locks.setdefault(key, asyncio.Lock())
+
+        async def _bounded():
+            async with self._dispatch_semaphore:
+                async with lock:
+                    return await operation()
+
+        # The timeout covers queueing as well as network work, preventing an
+        # unavailable destination from accumulating waiters forever.
+        return await asyncio.wait_for(_bounded(), timeout=self._send_timeout)
 
     # Helpers
     def _other_platforms_in_bridge(self, bridge: dict, source_name: str):
@@ -56,9 +122,7 @@ class Router:
                 yield pname, chat_id, instance
 
     def _find_bridge(self, bridge_name: str) -> dict | None:
-        for b in self.bridges:
-            if b["name"] == bridge_name: return b
-        return None
+        return self._bridges_by_name.get(bridge_name)
 
     # Public dispatch methods
     async def on_message(
@@ -93,22 +157,36 @@ class Router:
                 )
             return
 
-        for tgt_name, chat_id, tgt_platform in self._other_platforms_in_bridge(bridge, source_platform):
-            reply_native_id = None
-            if replied_to_msg_id is not None:
-                reply_native_id = await database.resolve_native_id(
-                    self.db_path, bridge_name, source_platform, replied_to_msg_id, tgt_name,
+        async def _send_one(tgt_name, chat_id, tgt_platform):
+            async def _operation():
+                reply_native_id = None
+                if replied_to_msg_id is not None:
+                    reply_native_id = await self._resolve_native_id(
+                        bridge_name, source_platform, replied_to_msg_id, tgt_name,
+                    )
+                return await tgt_platform.send_text(
+                    chat_id, content, sender, reply_to_native_id=reply_native_id,
+                    trusted_internal=False,
                 )
-
-            sent_id = await tgt_platform.send_text(chat_id, content, sender, reply_to_native_id=reply_native_id)
-
-            if sent_id is not None:
-                await database.save_message_mapping(
-                    self.db_path, bridge_name,
-                    source_platform, source_msg_id,
-                    tgt_name, sent_id,
-                    sender=sender,
+            try:
+                sent_id = await self._ordered_target_call(tgt_name, chat_id, _operation)
+                if sent_id is None:
+                    return None
+                return (bridge_name, source_platform, source_msg_id, tgt_name, sent_id, sender)
+            except Exception as exc:
+                logger.error(
+                    "Text dispatch to %s:%s failed: %s", tgt_name, chat_id, exc,
+                    exc_info=True,
                 )
+                return None
+
+        jobs = [
+            _send_one(tgt_name, chat_id, tgt_platform)
+            for tgt_name, chat_id, tgt_platform
+            in self._other_platforms_in_bridge(bridge, source_platform)
+        ]
+        rows = [row for row in await asyncio.gather(*jobs) if row] if jobs else []
+        await self._save_mappings(rows)
 
         # Link enrichment runs AFTER the original is delivered ("keep link +
         # append enrichment").
@@ -156,24 +234,42 @@ class Router:
             return
 
         # Modes 1 & 2: immediate fan-out
-        for tgt_name, chat_id, tgt_platform in self._other_platforms_in_bridge(bridge, source_platform):
-            reply_native_id = None
-            if replied_to_msg_id is not None:
-                reply_native_id = await database.resolve_native_id(
-                    self.db_path, bridge_name, source_platform, replied_to_msg_id, tgt_name,
+        async def _send_file_one(tgt_name, chat_id, tgt_platform):
+            async def _operation():
+                reply_native_id = None
+                if replied_to_msg_id is not None:
+                    reply_native_id = await self._resolve_native_id(
+                        bridge_name, source_platform, replied_to_msg_id, tgt_name,
+                    )
+                return await tgt_platform.send_file(
+                    chat_id, file_path, file_ext, sender,
+                    reply_to_native_id=reply_native_id,
+                    trusted_internal=False,
                 )
-
-            sent_id = await tgt_platform.send_file(chat_id, file_path, file_ext, sender, reply_to_native_id=reply_native_id)
-
-            if sent_id is not None and save_mapping:
-                await database.save_message_mapping(
-                    self.db_path, bridge_name,
-                    source_platform, source_msg_id,
-                    tgt_name, sent_id,
-                    sender=sender,
+            try:
+                sent_id = await self._ordered_target_call(tgt_name, chat_id, _operation)
+                if sent_id is None or not save_mapping:
+                    return None
+                return (bridge_name, source_platform, source_msg_id, tgt_name, sent_id, sender)
+            except Exception as exc:
+                logger.error(
+                    "File dispatch to %s:%s failed: %s", tgt_name, chat_id, exc,
+                    exc_info=True,
                 )
+                return None
 
-        if os.path.isfile(file_path): os.remove(file_path)
+        jobs = [
+            _send_file_one(tgt_name, chat_id, tgt_platform)
+            for tgt_name, chat_id, tgt_platform
+            in self._other_platforms_in_bridge(bridge, source_platform)
+        ]
+        try:
+            rows = [row for row in await asyncio.gather(*jobs) if row] if jobs else []
+            await self._save_mappings(rows)
+        finally:
+            if os.path.isfile(file_path):
+                try: os.remove(file_path)
+                except OSError: pass
 
         # Mode 2: also note the upload in the digest body.
         if digest_cfg:
@@ -241,7 +337,11 @@ class Router:
                             reply_id = await database.resolve_native_id(
                                 self.db_path, bridge_name, source_platform, source_msg_id, tgt_name,
                             )
-                        await tgt_platform.send_text(chat_id, body, bridge_name, reply_to_native_id=reply_id)
+                        await tgt_platform.send_text(
+                            chat_id, body, bridge_name,
+                            reply_to_native_id=reply_id,
+                            trusted_internal=True,
+                        )
 
             # --- MEDIA ---
             # on_file is already digest-aware: in digest mode it buffers the
@@ -277,7 +377,11 @@ class Router:
             reply_native_id = await database.resolve_native_id(
                 self.db_path, bridge_name, source_platform, source_msg_id, tgt_name,
             )
-            await tgt_platform.send_text(chat_id, content, bridge_name, reply_to_native_id=reply_native_id)
+            await tgt_platform.send_text(
+                chat_id, content, bridge_name,
+                reply_to_native_id=reply_native_id,
+                trusted_internal=True,
+            )
 
     # Digest buffering ---------------------------------------------------
 
@@ -288,13 +392,24 @@ class Router:
         buf = self._digest_buffers.get(key)
         if buf is None:
             async def _on_flush(entries, pending_files) -> None:
-                await self._flush_digest(bridge_name, source_platform, entries, pending_files)
+                try:
+                    await self._flush_digest(bridge_name, source_platform, entries, pending_files)
+                finally:
+                    current = self._digest_buffers.get(key)
+                    if current is not None and current.is_idle:
+                        self._digest_buffers.pop(key, None)
             buf = _DigestBuffer(
                 _on_flush,
                 cfg["wait_seconds"],
                 max_wait_seconds=cfg.get("max_wait_seconds", 0.0),
+                max_entries=cfg.get("max_entries", 500),
+                max_text_bytes=cfg.get("max_text_bytes", 1024 * 1024),
+                max_files=cfg.get("max_files", 25),
+                max_file_bytes=cfg.get("max_file_bytes", 256 * 1024 * 1024),
             )
             self._digest_buffers[key] = buf
+        else:
+            buf.update_config(cfg)
         return buf
 
     async def _enqueue_digest(self, bridge: dict, source_platform: str, sender: str, content: str, cfg: dict,
@@ -337,6 +452,7 @@ class Router:
                     sent_id = await tgt_platform.send_file(
                         chat_id, pf["file_path"], pf["file_ext"], pf["sender"],
                         reply_to_native_id=None,
+                        trusted_internal=False,
                     )
                     if sent_id is not None:
                         await database.save_message_mapping(
@@ -358,7 +474,9 @@ class Router:
             for tgt_name, chat_id, tgt_platform in self._other_platforms_in_bridge(bridge, source_platform):
                 body = tgt_platform.format_digest_body(entries)
                 if body:
-                    await tgt_platform.send_text(chat_id, body, bridge_name)
+                    await tgt_platform.send_text(
+                        chat_id, body, bridge_name, trusted_internal=True,
+                    )
 
 
 class _DigestBuffer:
@@ -373,7 +491,9 @@ class _DigestBuffer:
     active channel still gets a digest at most once every
     ``max_wait_seconds``."""
 
-    def __init__(self, on_flush, wait_seconds: float, max_wait_seconds: float = 0.0):
+    def __init__(self, on_flush, wait_seconds: float, max_wait_seconds: float = 0.0,
+                 max_entries: int = 500, max_text_bytes: int = 1024 * 1024,
+                 max_files: int = 25, max_file_bytes: int = 256 * 1024 * 1024):
         self._on_flush = on_flush
         self._wait_seconds = float(wait_seconds)
         self._max_wait_seconds = float(max_wait_seconds)
@@ -383,6 +503,41 @@ class _DigestBuffer:
         # Wall-clock start of the current cycle. Set on the first add of
         # a cycle, cleared on flush. Used to enforce max_wait_seconds.
         self._first_entry_ts: float | None = None
+        self._max_entries = int(max_entries)
+        self._max_text_bytes = int(max_text_bytes)
+        self._max_files = int(max_files)
+        self._max_file_bytes = int(max_file_bytes)
+        self._text_bytes = 0
+        self._file_bytes = 0
+
+    @property
+    def is_idle(self) -> bool:
+        return not self._entries and not self._pending_files and (
+            self._task is None or self._task.done()
+        )
+
+    def update_config(self, cfg: dict) -> None:
+        """Apply hot-reloaded timing and capacity values to this buffer."""
+        self._wait_seconds = float(cfg.get("wait_seconds", self._wait_seconds))
+        self._max_wait_seconds = float(cfg.get("max_wait_seconds", self._max_wait_seconds))
+        self._max_entries = int(cfg.get("max_entries", self._max_entries))
+        self._max_text_bytes = int(cfg.get("max_text_bytes", self._max_text_bytes))
+        self._max_files = int(cfg.get("max_files", self._max_files))
+        self._max_file_bytes = int(cfg.get("max_file_bytes", self._max_file_bytes))
+
+    def discard(self) -> None:
+        """Cancel a deleted bridge's buffer and remove owned pending files."""
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        for pending in self._pending_files:
+            try: os.remove(pending["file_path"])
+            except OSError: pass
+        self._entries = []
+        self._pending_files = []
+        self._text_bytes = 0
+        self._file_bytes = 0
+        self._first_entry_ts = None
+        self._task = None
 
     def add(self, sender: str, content: str, ts: float | None = None) -> None:
         # *ts* is the source-platform message timestamp when available;
@@ -391,7 +546,9 @@ class _DigestBuffer:
         # relative to their actual send order.
         if ts is None: ts = time.time()
         self._entries.append((ts, sender, content))
-        self._reschedule()
+        self._text_bytes += len(content.encode("utf-8", errors="replace"))
+        force = len(self._entries) >= self._max_entries or self._text_bytes >= self._max_text_bytes
+        self._reschedule(force=force)
 
     def add_file(self, sender: str, file_path: str, file_ext: str,
                  source_msg_id, replied_to_msg_id, ts: float | None = None) -> None:
@@ -404,9 +561,13 @@ class _DigestBuffer:
             "source_msg_id": source_msg_id,
             "replied_to_msg_id": replied_to_msg_id,
         })
-        self._reschedule()
+        try: size = os.path.getsize(file_path)
+        except OSError: size = 0
+        self._file_bytes += size
+        force = len(self._pending_files) >= self._max_files or self._file_bytes >= self._max_file_bytes
+        self._reschedule(force=force)
 
-    def _reschedule(self) -> None:
+    def _reschedule(self, force: bool = False) -> None:
         """Cancel any pending flush and re-arm the timer.
 
         Computes the next-flush delay as ``min(wait_seconds, remaining
@@ -415,7 +576,7 @@ class _DigestBuffer:
         now = time.time()
         if self._first_entry_ts is None:
             self._first_entry_ts = now
-        wait = self._wait_seconds
+        wait = 0.0 if force else self._wait_seconds
         if self._max_wait_seconds > 0:
             elapsed = now - self._first_entry_ts
             wait = min(wait, max(0.0, self._max_wait_seconds - elapsed))
@@ -436,6 +597,8 @@ class _DigestBuffer:
         files = self._pending_files
         self._entries = []
         self._pending_files = []
+        self._text_bytes = 0
+        self._file_bytes = 0
         self._first_entry_ts = None
         self._task = None
         if not (entries or files): return

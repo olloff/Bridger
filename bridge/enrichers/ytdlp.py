@@ -10,6 +10,7 @@ to fetch the caption.
 import asyncio
 import os
 import shutil
+import uuid
 
 from bridge.enrichers.base import BaseEnricher, EnrichResult
 from bridge.utils.logger import get_logger
@@ -17,6 +18,11 @@ from bridge.utils.logger import get_logger
 logger = get_logger("enrich.ytdlp")
 
 _YTDLP_TIMEOUT = 180.0
+try:
+    _YTDLP_CONCURRENCY = max(1, int(os.environ.get("BRIDGER_YTDLP_CONCURRENCY", "2")))
+except ValueError:
+    _YTDLP_CONCURRENCY = 2
+_YTDLP_SEMAPHORE = asyncio.Semaphore(_YTDLP_CONCURRENCY)
 
 
 class YtDlpEnricher(BaseEnricher):
@@ -43,8 +49,12 @@ class YtDlpEnricher(BaseEnricher):
             return None
 
         os.makedirs(dest_dir, exist_ok=True)
-        max_mb = int(cfg.get("max_media_mb", 50))
-        out_tmpl = os.path.join(dest_dir, f"{self.name}_media_%(id)s.%(ext)s")
+        max_bytes = int(float(cfg.get("max_media_mb", 50)) * 1024 * 1024)
+        max_mb = max(1, int(max_bytes / (1024 * 1024)))
+        # A unique prefix prevents concurrent enrichment of the same post from
+        # racing over one output path.
+        job_id = uuid.uuid4().hex
+        out_tmpl = os.path.join(dest_dir, f"{self.name}_{job_id}_%(id)s.%(ext)s")
         args = [
             "yt-dlp",
             "--no-playlist",
@@ -67,9 +77,35 @@ class YtDlpEnricher(BaseEnricher):
             args += ["--print", "%(title)s"]
         args += ["--print", "after_move:filepath", clean_url]
 
-        path, caption = await self._run(args)
+        async with _YTDLP_SEMAPHORE:
+            path, caption = await self._run(args)
         if not path or not os.path.isfile(path):
             return None
+        # Treat subprocess stdout as untrusted. The only acceptable result is
+        # a regular file beneath the staging directory created by this app.
+        abs_dir = os.path.realpath(dest_dir)
+        abs_path = os.path.realpath(path)
+        try:
+            inside = os.path.commonpath([abs_dir, abs_path]) == abs_dir
+        except ValueError:
+            inside = False
+        expected_prefix = f"{self.name}_{job_id}_"
+        if not inside or not os.path.basename(abs_path).startswith(expected_prefix):
+            logger.error("yt-dlp returned an unsafe output path for %s", self.name)
+            return None
+        try:
+            actual_size = os.path.getsize(abs_path)
+        except OSError:
+            return None
+        if actual_size > max_bytes:
+            logger.warning(
+                "yt-dlp output for %s is %.1f MB > %.1f MB cap; discarding",
+                self.name, actual_size / (1024 * 1024), max_bytes / (1024 * 1024),
+            )
+            try: os.remove(abs_path)
+            except OSError: pass
+            return None
+        path = abs_path
         ext = os.path.splitext(path)[1] or ".mp4"
         return EnrichResult(
             author=self.author_label,

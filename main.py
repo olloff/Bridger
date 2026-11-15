@@ -5,7 +5,7 @@ import time
 import yaml
 from bridge import __version__
 from bridge.utils.config import load_settings, ensure_directories, get_bridges, get_enabled_platforms, get_platform_config, BRIDGE_DB
-from bridge.database import init_db
+from bridge.database import init_db, MessageStore
 from bridge.router import Router
 from bridge.utils.logger import setup_logging, get_logger
 from bridge.utils.watch import SettingsWatcher
@@ -177,9 +177,19 @@ async def main() -> int:
         logger.error("No platforms enabled — nothing to do.")
         return 2
 
+    # Create one process-lifetime database connection for the routing hot path.
+    try:
+        db_store = await MessageStore(BRIDGE_DB).open()
+    except Exception as exc:
+        logger.error("Cannot open persistent message store: %s", exc, exc_info=True)
+        return 2
+
     # Create the router and wire it into each platform
     forward_reactions = bool(settings.get("forward_reactions", False))
-    router = Router(platforms, bridges, db_path=BRIDGE_DB, forward_reactions=forward_reactions)
+    router = Router(
+        platforms, bridges, db_path=BRIDGE_DB,
+        forward_reactions=forward_reactions, db_store=db_store,
+    )
     logger.info("Reaction forwarding: %s", "ON" if forward_reactions else "OFF")
     for p in platforms.values():
         p.router = router
@@ -195,7 +205,7 @@ async def main() -> int:
                 "Platform set changed in settings.yaml (was %s, now %s) — restart required for that to take effect",
                 sorted(platforms.keys()), sorted(new_enabled),
             )
-        router.bridges = new_bridges
+        router.apply_bridges(new_bridges)
         new_forward_reactions = bool(new_settings.get("forward_reactions", False))
         if new_forward_reactions != router.forward_reactions:
             logger.info("Reaction forwarding toggled: %s → %s",
@@ -203,7 +213,7 @@ async def main() -> int:
                         "ON" if new_forward_reactions else "OFF")
             router.forward_reactions = new_forward_reactions
         for name, platform in platforms.items():
-            platform.bridges = new_bridges
+            platform.set_bridges(new_bridges)
             platform.apply_config(get_platform_config(new_settings, name))
         new_janitor_cfg = new_settings.get("janitor") or {}
         new_max_age = max(60.0, float(new_janitor_cfg.get("max_age_seconds", 3600)))
@@ -239,8 +249,18 @@ async def main() -> int:
         "Starting %d platform(s): %s",
         len(platforms), ", ".join(platforms.keys()),
     )
-    await asyncio.gather(*(p.start() for p in platforms.values()))
-    return 0
+    try:
+        await asyncio.gather(*(p.start() for p in platforms.values()))
+        return 0
+    finally:
+        await watcher.stop()
+        await janitor.stop()
+        await asyncio.gather(*(p.stop() for p in platforms.values()), return_exceptions=True)
+        from bridge.enrichers import close_enrichers
+        from bridge.transcription import close_transcribers
+        await close_enrichers()
+        await close_transcribers()
+        await db_store.close()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,17 @@
-version: '3.8'
-
 services:
   telegram-discord-bridge:
     build: .
     container_name: telegram-discord-bridge
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${BRIDGER_PIDS_LIMIT:-128}
+    cpus: ${BRIDGER_CPU_LIMIT:-2.0}
+    mem_limit: ${BRIDGER_MEMORY_LIMIT:-2g}
 
     volumes:
       # Config directory (read-only). Put your settings.yaml inside
@@ -24,16 +31,36 @@ services:
       # can tail / inspect them from the host without docker logs.
       - ./logs:/app/logs
 
+      # Writable model/cache location for optional local transcription while
+      # the rest of the container filesystem remains read-only.
+      - model-cache:/home/app/.cache
+
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+
     environment:
       - PYTHONUNBUFFERED=1
       # Point the bridge at the settings file inside the mounted directory.
       # Override BRIDGER_SETTINGS_PATH if you mount the config dir
       # somewhere else.
       - BRIDGER_SETTINGS_PATH=/app/dis_to_tg/settings.yaml
+      - BRIDGER_TRANSCRIPTION_CONCURRENCY=${BRIDGER_TRANSCRIPTION_CONCURRENCY:-1}
+      - BRIDGER_YTDLP_CONCURRENCY=${BRIDGER_YTDLP_CONCURRENCY:-2}
+      - BRIDGER_TRANSCODE_CONCURRENCY=${BRIDGER_TRANSCODE_CONCURRENCY:-2}
+      - BRIDGER_SEND_TIMEOUT=${BRIDGER_SEND_TIMEOUT:-120}
+      - BRIDGER_DISPATCH_CONCURRENCY=${BRIDGER_DISPATCH_CONCURRENCY:-32}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     # Optional: Override command for debugging
     # command: python -u main.py
 
 volumes:
   message-data:
+    driver: local
+  model-cache:
     driver: local

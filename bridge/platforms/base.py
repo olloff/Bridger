@@ -28,6 +28,11 @@ class BasePlatform(ABC):
         self.name = name
         self.platform_config = platform_config
         self.bridges = bridges
+        self._bridge_by_name: dict[str, dict] = {}
+        self._bridge_for_chat: dict[object, str] = {}
+        self._bridge_for_source_chat: dict[object, str] = {}
+        self._targets_by_bridge: dict[str, list] = {}
+        self._rebuild_bridge_indexes()
         self.router = router
 
     # Lifecycle
@@ -51,10 +56,14 @@ class BasePlatform(ABC):
         content: str,
         sender: str,
         reply_to_native_id=None,
+        *,
+        trusted_internal: bool = False,
     ) -> int | None:
         """Send a text message to *chat_id*.
         Returns the **native message ID** of the sent message, or ``None``
-        if sending failed.
+        if sending failed. ``trusted_internal`` is an explicit rendering
+        boundary: it may only be set for bridge-generated, destination-safe
+        markup. It must never be inferred from user-controlled strings.
         """
 
     @abstractmethod
@@ -65,6 +74,8 @@ class BasePlatform(ABC):
         file_ext: str,
         sender: str,
         reply_to_native_id=None,
+        *,
+        trusted_internal: bool = False,
     ) -> int | None:
         """Send a file/attachment to *chat_id*.
         Returns the **native message ID** of the sent message, or ``None``
@@ -121,37 +132,47 @@ class BasePlatform(ABC):
         self.platform_config = platform_config
 
     # Helpers
+    def set_bridges(self, bridges: list[dict]) -> None:
+        """Atomically replace bridge definitions and rebuild lookup indexes."""
+        self.bridges = bridges
+        self._rebuild_bridge_indexes()
+
+    def _rebuild_bridge_indexes(self) -> None:
+        self._bridge_by_name = {}
+        self._bridge_for_chat = {}
+        self._bridge_for_source_chat = {}
+        self._targets_by_bridge = {}
+        for bridge in self.bridges:
+            name = bridge.get("name")
+            if not name:
+                continue
+            self._bridge_by_name[name] = bridge
+            for chat_id in bridge_all_platforms(bridge).get(self.name, []):
+                self._bridge_for_chat.setdefault(chat_id, name)
+            for chat_id in bridge_sources(bridge).get(self.name, []):
+                self._bridge_for_source_chat.setdefault(chat_id, name)
+            self._targets_by_bridge[name] = list(bridge_targets(bridge).get(self.name, []))
+
     def bridge_name_for_chat(self, chat_id) -> str | None:
         """Return the bridge name that involves *chat_id* on this platform —
         regardless of direction. Used by outbound formatting paths that just
         need to know which bridge a chat belongs to."""
-        for b in self.bridges:
-            if chat_id in bridge_all_platforms(b).get(self.name, []): return b["name"]
-        return None
+        return self._bridge_for_chat.get(chat_id)
 
     def bridge_name_for_source_chat(self, chat_id) -> str | None:
         """Return the bridge name where *chat_id* is a **source** for this
         platform. Used by inbound dispatch — messages on a target-only chat
         have no bridge to forward into."""
-        for b in self.bridges:
-            if chat_id in bridge_sources(b).get(self.name, []): return b["name"]
-        return None
+        return self._bridge_for_source_chat.get(chat_id)
 
     def chat_ids_for_bridge(self, bridge_name: str) -> list:
         """Return this platform's *target* chat IDs for a given bridge."""
-        for b in self.bridges:
-            if b["name"] == bridge_name: return list(bridge_targets(b).get(self.name, []))
-        return []
+        return list(self._targets_by_bridge.get(bridge_name, []))
 
     def my_chat_ids(self) -> list:
         """Return all chat IDs this platform should listen to (its source chats)."""
-        ids: list = []
-        for b in self.bridges:
-            ids.extend(bridge_sources(b).get(self.name, []))
-        return ids
+        return list(self._bridge_for_source_chat.keys())
 
     def find_bridge_by_name(self, name: str) -> dict | None:
         """Return the bridge dict by name, or ``None`` if not found."""
-        for b in self.bridges:
-            if b["name"] == name: return b
-        return None
+        return self._bridge_by_name.get(name)

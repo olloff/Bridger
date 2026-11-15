@@ -17,7 +17,7 @@ from bridge.utils.config import (
     effective_destination_size_limit_bytes,
     bridge_digest_config, platform_voice_transcription_config,
 )
-from bridge.transcription import get_transcriber
+from bridge.transcription import get_transcriber, transcription_slot
 from bridge.utils.media import get_unique_filepath
 from bridge.utils.transcode import compress_to_fit
 from bridge.utils.logger import get_logger, safe_for_log
@@ -34,6 +34,19 @@ logger = get_logger("discord")
 
 MESSAGE_CHUNK_LIMIT = 1800
 
+
+def _escape_sender(s: str) -> str:
+    """Escape Discord markdown metacharacters in an attribution label."""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", str(s))
+
+
+def _minimum_intents():
+    """Return the non-privileged defaults plus required message content."""
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.reactions = True
+    return intents
+
 class DiscordPlatform(BasePlatform):
     """discord.py-based Discord bridge platform."""
 
@@ -48,10 +61,12 @@ class DiscordPlatform(BasePlatform):
         self._destination_size_limit_bytes = parse_upload_limit_mb(platform_config.get("destination_size_limit_mb"), DEFAULT_DESTINATION_SIZE_LIMIT_MB)
         logger.info("Discord destination size limit: %d bytes (%.1f MB)",
                     self._destination_size_limit_bytes, self._destination_size_limit_bytes / (1024 * 1024))
+        self._allowed_mentions = discord.AllowedMentions.none()
         self._bot = commands.Bot(
             command_prefix=".",
-            intents=discord.Intents.all(),
+            intents=_minimum_intents(),
             application_id=app_id,
+            allowed_mentions=self._allowed_mentions,
         )
         self._ready_event = asyncio.Event()
         self._register_handlers()
@@ -119,11 +134,15 @@ class DiscordPlatform(BasePlatform):
             # Voice transcription runs BEFORE the mention/whitelist gate so
             # reply_with_transcript also fires for voice messages that the
             # filter would otherwise drop.
-            transcript = await self._maybe_transcribe(message)
+            vt_cfg = platform_voice_transcription_config(self.platform_config)
+            transcribe_before_filter = bool(vt_cfg and vt_cfg.get("transcribe_filtered_messages"))
+            transcript = await self._maybe_transcribe(message) if transcribe_before_filter else None
 
             # Digest mode: bypass per-user / mention filters so the buffered
             # thread captures every message in the chat.
             if bridge_name and bridge_digest_config(bridge):
+                if not transcribe_before_filter:
+                    transcript = await self._maybe_transcribe(message)
                 await self._handle_incoming_message(message, transcript=transcript)
                 return
 
@@ -133,6 +152,8 @@ class DiscordPlatform(BasePlatform):
             eff_always_forward = effective_always_forward_user_ids(bridge, self._always_forward_user_ids)
             if message.author.id in eff_always_forward:
                 logger.info("Always-forward user %s — bypassing mention filter", message.author.id)
+                if not transcribe_before_filter:
+                    transcript = await self._maybe_transcribe(message)
                 await self._handle_incoming_message(message, transcript=transcript)
                 return
 
@@ -153,6 +174,8 @@ class DiscordPlatform(BasePlatform):
                 if text_has_mention and not message.attachments and is_mention_only(text, eff_filters):
                     logger.info("Skipping mention-only message %s (no content beyond mention)", message.id)
                     return
+            if not transcribe_before_filter:
+                transcript = await self._maybe_transcribe(message)
             await self._handle_incoming_message(message, transcript=transcript)
 
         @self._bot.event
@@ -318,25 +341,39 @@ class DiscordPlatform(BasePlatform):
                         safe_for_log(getattr(message.author, "display_name", "?")), max_dur)
             return None
 
+        reported_size = int(getattr(att, "size", 0) or 0)
+        max_file_bytes = vt_cfg["max_file_bytes"]
+        if reported_size > max_file_bytes:
+            logger.info(
+                "Voice from %s is %.1f MB > transcription cap %.1f MB — skipping",
+                safe_for_log(getattr(message.author, "display_name", "?")),
+                reported_size / (1024 * 1024), max_file_bytes / (1024 * 1024),
+            )
+            return None
+
         transcriber = get_transcriber(vt_cfg)
         if transcriber is None: return None
 
         media_dir = platform_media_dir(self.name)
         os.makedirs(media_dir, exist_ok=True)
         tmp_path = get_unique_filepath(media_dir, "voice_t", ".ogg")
-        try:
-            await att.save(fp=tmp_path)
-        except (OSError, discord.HTTPException, discord.NotFound) as exc:
-            logger.warning("Failed to download Discord voice for transcription: %s", exc)
-            try: os.remove(tmp_path)
-            except OSError: pass
-            return None
-
-        try:
-            transcript = await transcriber.transcribe(tmp_path, language=vt_cfg.get("language"))
-        finally:
-            try: os.remove(tmp_path)
-            except OSError: pass
+        async with transcription_slot():
+            try:
+                await att.save(fp=tmp_path)
+                actual_size = os.path.getsize(tmp_path) if os.path.isfile(tmp_path) else 0
+                if actual_size > max_file_bytes:
+                    logger.warning(
+                        "Downloaded voice is %.1f MB > transcription cap %.1f MB — discarding",
+                        actual_size / (1024 * 1024), max_file_bytes / (1024 * 1024),
+                    )
+                    return None
+                transcript = await transcriber.transcribe(tmp_path, language=vt_cfg.get("language"))
+            except (OSError, discord.HTTPException, discord.NotFound) as exc:
+                logger.warning("Failed to download/transcribe Discord voice: %s", exc)
+                return None
+            finally:
+                try: os.remove(tmp_path)
+                except OSError: pass
 
         if not transcript: return None
 
@@ -346,7 +383,10 @@ class DiscordPlatform(BasePlatform):
             # markdown — we leave the user-supplied transcript as-is here
             # (it came from Whisper, not from a third party).
             try:
-                await message.reply(f"🎙️ {transcript[:1900]}", mention_author=False)
+                await message.reply(
+                    f"🎙️ {transcript[:1900]}", mention_author=False,
+                    allowed_mentions=self._allowed_mentions,
+                )
             except (discord.HTTPException, discord.NotFound) as exc:
                 logger.warning("voice transcript local reply failed: %s", exc)
 
@@ -528,7 +568,10 @@ class DiscordPlatform(BasePlatform):
         await self.router.on_reaction(self.name, bridge_name, payload.message_id, emoji, sender)
 
     # Outbound messaging
-    async def send_text(self, chat_id, content: str, sender: str, reply_to_native_id=None) -> int | None:
+    async def send_text(
+        self, chat_id, content: str, sender: str, reply_to_native_id=None,
+        *, trusted_internal: bool = False,
+    ) -> int | None:
         channel = self._bot.get_channel(chat_id)
         if channel is None:
             logger.warning("Discord channel %s not found", chat_id)
@@ -540,16 +583,17 @@ class DiscordPlatform(BasePlatform):
             if reply_to_native_id:
                 try:
                     target_msg = channel.get_partial_message(reply_to_native_id)
-                    return await target_msg.reply(text)
+                    return await target_msg.reply(text, allowed_mentions=self._allowed_mentions)
                 except discord.HTTPException: pass
-            return await channel.send(text)
+            return await channel.send(text, allowed_mentions=self._allowed_mentions)
 
-        formatted = content if sender == bridge else f"*{sender}:*\n{content}"
+        safe_sender = _escape_sender(sender)
+        formatted = content if trusted_internal else f"*{safe_sender}:*\n{content}"
 
         sent_msg = None
         if len(content) > MESSAGE_CHUNK_LIMIT:
             for chunk in (content[i:i + MESSAGE_CHUNK_LIMIT] for i in range(0, len(content), MESSAGE_CHUNK_LIMIT)):
-                text = chunk if sender == bridge else f"*{sender}:*\n{chunk}"
+                text = chunk if trusted_internal else f"*{safe_sender}:*\n{chunk}"
                 sent_msg = await _reply_or_send(text)
                 reply_to_native_id = None
         else:
@@ -557,7 +601,10 @@ class DiscordPlatform(BasePlatform):
 
         return sent_msg.id if sent_msg else None
 
-    async def send_file(self, chat_id, file_path: str, file_ext: str, sender: str, reply_to_native_id=None) -> int | None:
+    async def send_file(
+        self, chat_id, file_path: str, file_ext: str, sender: str,
+        reply_to_native_id=None, *, trusted_internal: bool = False,
+    ) -> int | None:
         channel = self._bot.get_channel(chat_id)
         if channel is None:
             logger.warning("Discord channel %s not found", chat_id)
@@ -570,11 +617,14 @@ class DiscordPlatform(BasePlatform):
             if reply_to_native_id:
                 try:
                     target_msg = channel.get_partial_message(reply_to_native_id)
-                    return await target_msg.reply(content=content, file=file)
+                    return await target_msg.reply(
+                        content=content, file=file,
+                        allowed_mentions=self._allowed_mentions,
+                    )
                 except discord.HTTPException: pass
-            if content and file: return await channel.send(content=content, file=file)
-            elif content: return await channel.send(content=content)
-            elif file: return await channel.send(file=file)
+            if content and file: return await channel.send(content=content, file=file, allowed_mentions=self._allowed_mentions)
+            elif content: return await channel.send(content=content, allowed_mentions=self._allowed_mentions)
+            elif file: return await channel.send(file=file, allowed_mentions=self._allowed_mentions)
             return None
 
         actual_path = file_path
@@ -598,14 +648,14 @@ class DiscordPlatform(BasePlatform):
             else:
                 limit_mb = limit // (1024 * 1024)
                 msg = f"File is {original_size / (1024 * 1024):.1f} MB, over the {limit_mb} MB limit, and couldn't be transcoded. Sorry :("
-                text = msg if sender == bridge else f"*{sender}:* {msg}"
+                text = msg if trusted_internal else f"*{_escape_sender(sender)}:* {msg}"
                 await _send_with_reply(content=text)
                 return None
 
         sent_msg = None
         try:
-            if sender == bridge: sent_msg = await _send_with_reply(file=discord.File(actual_path))
-            else: sent_msg = await _send_with_reply(file=discord.File(actual_path), content=f"*{sender}:* [{file_name}]")
+            if trusted_internal: sent_msg = await _send_with_reply(file=discord.File(actual_path))
+            else: sent_msg = await _send_with_reply(file=discord.File(actual_path), content=f"*{_escape_sender(sender)}:* [{file_name}]")
         finally:
             if transcoded_path:
                 try: os.remove(transcoded_path)
@@ -688,8 +738,9 @@ class DiscordPlatform(BasePlatform):
         failed login — and re-attach handlers."""
         self._bot = commands.Bot(
             command_prefix=".",
-            intents=discord.Intents.all(),
+            intents=_minimum_intents(),
             application_id=self.platform_config["app_id"],
+            allowed_mentions=self._allowed_mentions,
         )
         self._ready_event = asyncio.Event()
         self._register_handlers()

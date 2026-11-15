@@ -39,14 +39,14 @@ class FakePlatform:
         self.sent_files: list[tuple] = []  # (chat_id, file_path, sender, reply_to)
         self._next_id = 1
 
-    async def send_text(self, chat_id, content, sender, reply_to_native_id=None):
-        self.sent_text.append((chat_id, content, sender, reply_to_native_id))
+    async def send_text(self, chat_id, content, sender, reply_to_native_id=None, *, trusted_internal=False):
+        self.sent_text.append((chat_id, content, sender, reply_to_native_id, trusted_internal))
         msg_id = self._next_id
         self._next_id += 1
         return msg_id
 
-    async def send_file(self, chat_id, file_path, file_ext, sender, reply_to_native_id=None):
-        self.sent_files.append((chat_id, file_path, sender, reply_to_native_id))
+    async def send_file(self, chat_id, file_path, file_ext, sender, reply_to_native_id=None, *, trusted_internal=False):
+        self.sent_files.append((chat_id, file_path, sender, reply_to_native_id, trusted_internal))
         msg_id = self._next_id
         self._next_id += 1
         return msg_id
@@ -147,6 +147,30 @@ class TestRouterDispatch(unittest.IsolatedAsyncioTestCase):
         await router.on_message("discord", "b", 1, "hi", "Alice")
         self.assertEqual(len(self.tg.sent_text), 3)
         self.assertEqual({c[0] for c in self.tg.sent_text}, {-200, -300, -400})
+
+    async def test_target_failure_isolated_from_other_destinations(self):
+        """One target exception must not abort unrelated fan-out targets."""
+        wa = FakePlatform("whatsapp")
+        self.tg.send_text = AsyncMock(side_effect=RuntimeError("target down"))
+        platforms = {**self.platforms, "whatsapp": wa}
+        bridges = [{
+            "name": "b",
+            "from": {"discord": 100},
+            "to": {"telegram": -200, "whatsapp": "group@g.us"},
+        }]
+        router = Router(platforms, bridges, db_path=":memory:")
+        await router.on_message("discord", "b", 1, "hi", "Alice")
+        self.assertEqual(len(wa.sent_text), 1)
+        self.assertEqual(wa.sent_text[0][0], "group@g.us")
+
+    async def test_external_and_internal_rendering_flags_are_explicit(self):
+        bridges = [{"name": "b", "platforms": {"telegram": -100, "discord": 200}}]
+        router = Router(self.platforms, bridges, db_path=":memory:", forward_reactions=True)
+        await router.on_message("telegram", "b", 1, "hi", "b")
+        self.assertFalse(self.dc.sent_text[-1][4])
+        await router.on_reaction("telegram", "b", 1, "👍", "b")
+        self.assertTrue(self.dc.sent_text[-1][4])
+
 
     async def test_directional_does_not_route_target_side_inputs(self):
         """If a non-source platform somehow invokes routing, the only
@@ -542,6 +566,26 @@ class TestRouterDispatch(unittest.IsolatedAsyncioTestCase):
         # Immediate — no need to sleep
         self.assertEqual(len(self.dc.sent_text), 1)
         self.assertEqual(self.dc.sent_text[0][1], "hi")
+
+
+class TestDigestCapacityBounds(unittest.IsolatedAsyncioTestCase):
+    async def test_entry_limit_forces_early_flush(self):
+        from bridge.router import _DigestBuffer
+        flushed = asyncio.Event()
+        captured = []
+
+        async def on_flush(entries, files):
+            captured.append((entries, files))
+            flushed.set()
+
+        buf = _DigestBuffer(
+            on_flush, wait_seconds=60, max_entries=2,
+            max_text_bytes=1024 * 1024,
+        )
+        buf.add("Alice", "one")
+        buf.add("Bob", "two")
+        await asyncio.wait_for(flushed.wait(), timeout=1)
+        self.assertEqual(len(captured[0][0]), 2)
 
 
 if __name__ == "__main__":

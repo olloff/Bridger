@@ -407,11 +407,121 @@ class TestSettingsPathResolution(unittest.TestCase):
                 _os.chdir(cwd)
 
     def test_returns_preferred_when_nothing_exists(self):
-        import os as _os
+        import os as _os, tempfile
         import main as bridger_main
-        with patch.dict(_os.environ, {"BRIDGER_SETTINGS_PATH": "/definitely/not/here.yaml"}):
-            # Nothing exists → returns the env path so the error names it.
-            self.assertEqual(bridger_main._resolve_settings_path(), "/definitely/not/here.yaml")
+        with tempfile.TemporaryDirectory() as d:
+            cwd = _os.getcwd()
+            try:
+                _os.chdir(d)
+                with patch.dict(_os.environ, {"BRIDGER_SETTINGS_PATH": "/definitely/not/here.yaml"}):
+                    # Nothing exists → returns the env path so the error names it.
+                    self.assertEqual(bridger_main._resolve_settings_path(), "/definitely/not/here.yaml")
+            finally:
+                _os.chdir(cwd)
+
+
+class TestExplicitOutboundTrust(unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_sender_matching_bridge_name_is_still_escaped(self):
+        import sys
+        from unittest.mock import AsyncMock, MagicMock
+        sys.modules.setdefault("aiosqlite", MagicMock())
+        sys.modules.setdefault("pyrogram", MagicMock())
+        sys.modules.setdefault("pyrogram.enums", MagicMock())
+        from bridge.platforms.telegram import TelegramPlatform
+
+        platform = TelegramPlatform.__new__(TelegramPlatform)
+        sent = MagicMock(id=123)
+        platform._app = MagicMock()
+        platform._app.send_message = AsyncMock(return_value=sent)
+        await platform.send_text(
+            1, "<script>alert(1)</script>", "bridge",
+            trusted_internal=False,
+        )
+        rendered = platform._app.send_message.await_args.args[1]
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertNotIn("<script>", rendered)
+
+    async def test_discord_send_suppresses_mentions(self):
+        import sys
+        from unittest.mock import AsyncMock, MagicMock, sentinel
+        sys.modules.setdefault("aiosqlite", MagicMock())
+        sys.modules.setdefault("discord", MagicMock())
+        sys.modules.setdefault("discord.ext", MagicMock())
+        sys.modules.setdefault("discord.ext.commands", MagicMock())
+        from bridge.platforms.discord import DiscordPlatform
+
+        platform = DiscordPlatform.__new__(DiscordPlatform)
+        platform._allowed_mentions = sentinel.allowed_mentions
+        platform.bridge_name_for_chat = lambda _chat_id: "bridge"
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=MagicMock(id=321))
+        platform._bot = MagicMock()
+        platform._bot.get_channel.return_value = channel
+        await platform.send_text(1, "@everyone", "bridge", trusted_internal=False)
+        self.assertIs(
+            channel.send.await_args.kwargs["allowed_mentions"],
+            sentinel.allowed_mentions,
+        )
+
+
+class TestWhatsAppDownloadCaps(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import sys
+        from unittest.mock import MagicMock
+        for name in (
+            "neonize", "neonize.aioze", "neonize.aioze.client",
+            "neonize.aioze.events", "neonize.utils", "neonize.proto",
+            "neonize.proto.waE2E",
+            "neonize.proto.waE2E.WAWebProtobufsE2E_pb2",
+        ):
+            sys.modules.setdefault(name, MagicMock())
+
+    @staticmethod
+    def _message(size: int):
+        from unittest.mock import MagicMock
+        msg = MagicMock()
+        msg.Info.ID = "m1"
+        msg.Info.MessageSource.Chat.User = "group"
+        msg.Info.MessageSource.Chat.Server = "g.us"
+        msg.Info.MessageSource.Sender.User = "alice"
+        msg.Info.Pushname = "Alice"
+        payload = MagicMock()
+        payload.URL = "https://media.invalid/file"
+        payload.fileLength = size
+        payload.contextInfo.stanzaID = ""
+        msg.Message.imageMessage = payload
+        msg.Message.videoMessage.URL = ""
+        msg.Message.audioMessage.URL = ""
+        msg.Message.documentMessage.URL = ""
+        msg.Message.stickerMessage.URL = ""
+        msg.Message.reactionMessage = None
+        msg.Message.conversation = ""
+        msg.Message.extendedTextMessage = None
+        return msg
+
+    async def test_oversized_media_is_refused_before_download(self):
+        import asyncio
+        from collections import OrderedDict
+        from unittest.mock import AsyncMock, MagicMock
+        from bridge.platforms.whatsapp import WhatsAppPlatform
+
+        platform = WhatsAppPlatform.__new__(WhatsAppPlatform)
+        platform.name = "whatsapp"
+        platform._sent_ids = OrderedDict()
+        platform._bridge_name_for_jid = lambda _jid: "b"
+        platform.find_bridge_by_name = lambda _name: {"name": "b"}
+        platform._incoming_cap_for = lambda _bridge: 10
+        platform._reject_unknown_media_size = True
+        platform._download_semaphore = asyncio.Semaphore(1)
+        platform.router = MagicMock()
+        platform.router.on_file = AsyncMock()
+        platform.router.on_message = AsyncMock()
+        client = MagicMock()
+        client.download_any = AsyncMock(return_value=b"never")
+
+        await platform._handle_incoming(client, self._message(11))
+        client.download_any.assert_not_awaited()
+        platform.router.on_file.assert_not_awaited()
 
 
 class TestLoggingResilience(unittest.TestCase):

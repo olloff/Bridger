@@ -52,3 +52,15 @@ def get_enricher(url: str, providers: list[str]):
         if enricher is not None and enricher.matches(url):
             return enricher
     return None
+
+
+async def close_enrichers() -> None:
+    """Close reusable HTTP resources owned by enricher singletons."""
+    import asyncio
+    for enricher in _ENRICHERS.values():
+        close = getattr(enricher, "close", None)
+        if close is None:
+            continue
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result

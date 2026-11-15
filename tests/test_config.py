@@ -245,7 +245,15 @@ class TestBridgeDigestConfig(unittest.TestCase):
     def test_enabled_default_wait(self):
         self.assertEqual(
             bridge_digest_config({"digest": {"enabled": True}}),
-            {"wait_seconds": 300.0, "max_wait_seconds": 180.0, "buffer_media": False},
+            {
+                "wait_seconds": 300.0,
+                "max_wait_seconds": 180.0,
+                "buffer_media": False,
+                "max_entries": 500,
+                "max_text_bytes": 1024 * 1024,
+                "max_files": 25,
+                "max_file_bytes": 256 * 1024 * 1024,
+            },
         )
 
     def test_explicit_wait(self):

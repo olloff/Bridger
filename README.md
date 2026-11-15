@@ -28,6 +28,10 @@
 
 A lightweight, fully asynchronous Python application that creates multi-way bridges between Telegram chats, Discord channels, and WhatsApp groups/chats. Messages, media, reactions, and reply threads flow seamlessly across any number of configured bridges.
 
+The current performance and security remediation artifacts are documented in
+[the implementation plan](docs/performance-security-plan.md) and
+[the detailed fix record](docs/performance-security-fixes.md).
+
 ## Features
 
 - **Multi-way text bridging** — messages sent on any platform in a bridge appear on all others.
